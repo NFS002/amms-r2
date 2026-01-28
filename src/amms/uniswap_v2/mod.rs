@@ -459,13 +459,28 @@ impl UniswapV2Factory {
 
         let mut futures_unordered = FuturesUnordered::new();
         for group in pairs {
+            println!("Group: {:?}", group);
             let deployer = IGetUniswapV2PoolDataBatchRequestInstance::deploy_builder(
                 provider.clone(),
                 group.clone(),
             );
 
             futures_unordered.push(async move {
-                let res = deployer.call_raw().block(block_number).await?;
+                let res = match deployer.call_raw().block(block_number).await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        eprintln!("call_raw failed for pool data batch: {}", err);
+                        let empty: Vec<(Address, Address, u128, u128, u32, u32)> = vec![
+                            (Address::ZERO, Address::ZERO, 0, 0, 0, 0);
+                            group.len()
+                        ];
+                        return Ok::<
+                            (Vec<Address>, Vec<(Address, Address, u128, u128, u32, u32)>),
+                            AMMError,
+                        >((group, empty));
+                    }
+
+                };
 
                 let return_data =
                     <Vec<(Address, Address, u128, u128, u32, u32)> as SolValue>::abi_decode(&res)?;
@@ -600,7 +615,7 @@ impl DiscoverySync for UniswapV2Factory {
             address = ?self.address,
             "Syncing all pools"
         );
-
+        println!("About to sync all pools");
         UniswapV2Factory::sync_all_pools(amms, to_block, provider)
     }
 }
