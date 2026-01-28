@@ -397,7 +397,7 @@ impl UniswapV2Factory {
             .block(block_number)
             .await?
             .to::<usize>();
-
+        println!("Pairs length: {}", pairs_length);  
         let step = 766;
         let mut futures_unordered = FuturesUnordered::new();
         for i in (0..pairs_length).step_by(step) {
@@ -411,7 +411,15 @@ impl UniswapV2Factory {
             );
 
             futures_unordered.push(async move {
-                let res = deployer.call_raw().block(block_number).await?;
+                print!("Getting the tokens...");
+                let res = match deployer.call_raw().block(block_number).await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        eprintln!("call_raw failed for pairs batch starting at {}: {}", i, err);
+                        return Ok::<Vec<Address>, AMMError>(vec![Address::ZERO]);
+                    }
+                };
+                println!("Got the tokens!");
                 let return_data = <Vec<Address> as SolValue>::abi_decode(&res)?;
 
                 Ok::<Vec<Address>, AMMError>(return_data)
@@ -428,6 +436,7 @@ impl UniswapV2Factory {
             }
         }
 
+        println!("Finished getting all pairs");
         Ok(pairs)
     }
 
