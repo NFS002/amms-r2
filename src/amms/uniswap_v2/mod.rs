@@ -9,8 +9,10 @@ use super::{
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
     float::q64_to_float,
+    retry_queue::{run_retry_queue, RetryQueueOutcome},
     Token,
 };
+
 
 use alloy::{
     eips::BlockId,
@@ -21,13 +23,17 @@ use alloy::{
     sol,
     sol_types::{SolCall, SolEvent, SolValue},
 };
-use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
 use rug::Float;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, future::Future, hash::Hash};
+use std::{
+    collections::HashMap,
+    future::Future,
+    hash::Hash,
+};
 use thiserror::Error;
-use tracing::info;
+use tokio::time::Duration;
+use tracing::{info, warn};
 use IGetUniswapV2PoolDataBatchRequest::IGetUniswapV2PoolDataBatchRequestInstance;
 use IUniswapV2Factory::IUniswapV2FactoryInstance;
 
@@ -370,21 +376,31 @@ pub struct UniswapV2Factory {
     pub address: Address,
     pub fee: usize,
     pub creation_block: u64,
+    pub pair_discovery_retry_attempts: usize,
 }
 
 impl UniswapV2Factory {
+    const DEFAULT_PAIR_DISCOVERY_RETRY_ATTEMPTS: usize = 5;
+
     pub fn new(address: Address, fee: usize, creation_block: u64) -> Self {
         Self {
             address,
             creation_block,
             fee,
+            pair_discovery_retry_attempts: Self::DEFAULT_PAIR_DISCOVERY_RETRY_ATTEMPTS,
         }
+    }
+
+    pub fn with_pair_discovery_retry_attempts(mut self, attempts: usize) -> Self {
+        self.pair_discovery_retry_attempts = attempts;
+        self
     }
 
     pub async fn get_all_pairs<N, P>(
         factory_address: Address,
         block_number: BlockId,
         provider: P,
+        max_retry_attempts: usize,
     ) -> Result<Vec<Address>, AMMError>
     where
         N: Network,
@@ -397,38 +413,48 @@ impl UniswapV2Factory {
             .block(block_number)
             .await?
             .to::<usize>();
-        println!("Pairs length: {}", pairs_length);  
         let step = 766;
-        let mut futures_unordered = FuturesUnordered::new();
-        for i in (0..pairs_length).step_by(step) {
-            // Note that the batch contract handles if the step is greater than the pairs length
-            // So we can pass the step in as is without checking for this condition
-            let deployer = IGetUniswapV2PairsBatchRequest::deploy_builder(
-                provider.clone(),
-                U256::from(i),
-                U256::from(step),
-                factory_address,
-            );
+        info!(
+            target="amms::uniswap_v2::get_all_pairs",
+            pairs_length,
+            "Getting all pairs"
+        );
+        let retry_delay = Duration::from_secs(20);
+        let starts = (0..pairs_length).step_by(step).collect::<Vec<_>>();
 
-            futures_unordered.push(async move {
-                print!("Getting the tokens...");
-                let res = match deployer.call_raw().block(block_number).await {
-                    Ok(res) => res,
-                    Err(err) => {
-                        eprintln!("call_raw failed for pairs batch starting at {}: {}", i, err);
-                        return Ok::<Vec<Address>, AMMError>(vec![Address::ZERO]);
+        let (batches, _failed_starts) = run_retry_queue(
+            starts,
+            |start| {
+                let provider = provider.clone();
+                async move {
+                    let deployer = IGetUniswapV2PairsBatchRequest::deploy_builder(
+                        provider,
+                        U256::from(start),
+                        U256::from(step),
+                        factory_address,
+                    );
+
+                    match deployer.call_raw().block(block_number).await {
+                        Ok(res) => {
+                            let return_data = <Vec<Address> as SolValue>::abi_decode(&res)?;
+                            Ok::<RetryQueueOutcome<Vec<Address>, usize>, AMMError>(
+                                RetryQueueOutcome::Success(return_data),
+                            )
+                        }
+                        Err(_err) => Ok::<RetryQueueOutcome<Vec<Address>, usize>, AMMError>(
+                            RetryQueueOutcome::Retry(start),
+                        ),
                     }
-                };
-                println!("Got the tokens!");
-                let return_data = <Vec<Address> as SolValue>::abi_decode(&res)?;
-
-                Ok::<Vec<Address>, AMMError>(return_data)
-            });
-        }
+                }
+            },
+            max_retry_attempts,
+            retry_delay,
+            "amms::uniswap_v2::get_all_pairs",
+        )
+        .await?;
 
         let mut pairs = Vec::new();
-        while let Some(res) = futures_unordered.next().await {
-            let tokens = res?;
+        for tokens in batches {
             for token in tokens {
                 if !token.is_zero() {
                     pairs.push(token);
@@ -436,7 +462,6 @@ impl UniswapV2Factory {
             }
         }
 
-        println!("Finished getting all pairs");
         Ok(pairs)
     }
 
@@ -444,61 +469,64 @@ impl UniswapV2Factory {
         amms: Vec<AMM>,
         block_number: BlockId,
         provider: P,
+        max_retry_attempts: usize,
     ) -> Result<Vec<AMM>, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
         let step = 120;
-        let pairs = amms
+        let groups = amms
             .iter()
             .chunks(step)
             .into_iter()
             .map(|chunk| chunk.map(|amm| amm.address()).collect())
             .collect::<Vec<Vec<Address>>>();
 
-        let mut futures_unordered = FuturesUnordered::new();
-        for group in pairs {
-            println!("Group: {:?}", group);
-            let deployer = IGetUniswapV2PoolDataBatchRequestInstance::deploy_builder(
-                provider.clone(),
-                group.clone(),
-            );
+        let retry_delay = Duration::from_secs(20);
+        let (batch_results, _failed_groups) = run_retry_queue(
+            groups,
+            |group| {
+                let provider = provider.clone();
+                async move {
+                    let deployer = IGetUniswapV2PoolDataBatchRequestInstance::deploy_builder(
+                        provider,
+                        group.clone(),
+                    );
 
-            futures_unordered.push(async move {
-                let res = match deployer.call_raw().block(block_number).await {
-                    Ok(res) => res,
-                    Err(err) => {
-                        eprintln!("call_raw failed for pool data batch: {}", err);
-                        let empty: Vec<(Address, Address, u128, u128, u32, u32)> = vec![
-                            (Address::ZERO, Address::ZERO, 0, 0, 0, 0);
-                            group.len()
-                        ];
-                        return Ok::<
-                            (Vec<Address>, Vec<(Address, Address, u128, u128, u32, u32)>),
+                    match deployer.call_raw().block(block_number).await {
+                        Ok(res) => {
+                            let return_data = <Vec<(Address, Address, u128, u128, u32, u32)> as SolValue>::abi_decode(&res)?;
+                            Ok::<
+                                RetryQueueOutcome<
+                                    (Vec<Address>, Vec<(Address, Address, u128, u128, u32, u32)>),
+                                    Vec<Address>,
+                                >,
+                                AMMError,
+                            >(RetryQueueOutcome::Success((group, return_data)))
+                        }
+                        Err(_err) => Ok::<
+                            RetryQueueOutcome<
+                                (Vec<Address>, Vec<(Address, Address, u128, u128, u32, u32)>),
+                                Vec<Address>,
+                            >,
                             AMMError,
-                        >((group, empty));
+                        >(RetryQueueOutcome::Retry(group)),
                     }
-
-                };
-
-                let return_data =
-                    <Vec<(Address, Address, u128, u128, u32, u32)> as SolValue>::abi_decode(&res)?;
-
-                Ok::<(Vec<Address>, Vec<(Address, Address, u128, u128, u32, u32)>), AMMError>((
-                    group,
-                    return_data,
-                ))
-            });
-        }
+                }
+            },
+            max_retry_attempts,
+            retry_delay,
+            "amms::uniswap_v2::sync_all_pools",
+        )
+        .await?;
 
         let mut amms = amms
             .into_iter()
             .map(|amm| (amm.address(), amm))
             .collect::<HashMap<_, _>>();
 
-        while let Some(res) = futures_unordered.next().await {
-            let (group, return_data) = res?;
+        for (group, return_data) in batch_results {
             for (pool_data, pool_address) in return_data.iter().zip(group.iter()) {
                 // If the pool token A is not zero, signaling that the pool data was polulated
 
@@ -581,8 +609,13 @@ impl DiscoverySync for UniswapV2Factory {
 
         let provider = provider.clone();
         async move {
-            let pairs =
-                UniswapV2Factory::get_all_pairs(self.address, to_block, provider.clone()).await?;
+            let pairs = UniswapV2Factory::get_all_pairs(
+                self.address,
+                to_block,
+                provider.clone(),
+                self.pair_discovery_retry_attempts,
+            )
+            .await?;
 
             Ok(pairs
                 .into_iter()
@@ -615,8 +648,7 @@ impl DiscoverySync for UniswapV2Factory {
             address = ?self.address,
             "Syncing all pools"
         );
-        println!("About to sync all pools");
-        UniswapV2Factory::sync_all_pools(amms, to_block, provider)
+        UniswapV2Factory::sync_all_pools(amms, to_block, provider, self.pair_discovery_retry_attempts)
     }
 }
 

@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::info;
@@ -134,6 +134,9 @@ where
     }
 
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
+        let sync_start = Instant::now();
+        let factories_count = self.factories.len();
+        let amms_count = self.amms.len();
         let chain_tip = BlockId::from(self.provider.get_block_number().await?);
         let factories = self.factories.clone();
         let mut futures = FuturesUnordered::new();
@@ -214,6 +217,7 @@ where
             }));
         }
 
+
         let mut state_space = StateSpace::default();
         while let Some(res) = futures.next().await {
             let synced_amms = res??;
@@ -232,13 +236,23 @@ where
             }
         }
 
-        Ok(StateSpaceManager {
+        let ssm = StateSpaceManager {
             latest_block: Arc::new(AtomicU64::new(self.latest_block)),
             state: Arc::new(RwLock::new(state_space)),
             block_filter,
             provider: self.provider,
             phantom: PhantomData,
-        })
+        };
+
+        info!(
+            target: "state_space::sync",
+            elapsed_secs = sync_start.elapsed().as_secs_f32(),
+            factories = factories_count,
+            amms = amms_count,
+            "State space sync complete"
+        );
+
+        Ok(ssm)
     }
 }
 

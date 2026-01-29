@@ -15,6 +15,7 @@ pub mod erc_4626;
 pub mod error;
 pub mod factory;
 pub mod float;
+pub mod retry_queue;
 pub mod uniswap_v2;
 pub mod uniswap_v3;
 
