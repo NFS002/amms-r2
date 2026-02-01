@@ -4,6 +4,7 @@ pub mod whitelist;
 
 use async_trait::async_trait;
 use blacklist::BlacklistFilter;
+use value::ValueFilter;
 use whitelist::{PoolWhitelistFilter, TokenWhitelistFilter};
 
 use crate::amms::{amm::AMM, error::AMMError};
@@ -55,5 +56,5 @@ filter!(
     BlacklistFilter,
     PoolWhitelistFilter,
     TokenWhitelistFilter,
-    // ValueFilter
+    ValueFilter
 );

@@ -1,18 +1,20 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::collections::HashMap;
 
 use super::{AMMFilter, FilterStage};
 use crate::amms::{
     amm::{AutomatedMarketMaker, AMM},
     error::AMMError,
+    retry_queue::{run_retry_queue, RetryQueueOutcome},
 };
 use alloy::{
-    network::Network,
+    network::Ethereum,
     primitives::{Address, U256},
-    providers::Provider,
+    providers::{DynProvider, Provider},
     sol,
     sol_types::SolValue,
 };
 use async_trait::async_trait;
+use tokio::time::Duration;
 use WethValueInPools::{PoolInfo, PoolInfoReturn};
 
 sol! {
@@ -21,69 +23,115 @@ sol! {
     "src/amms/abi/WethValueInPoolsBatchRequest.json"
 }
 
-pub struct ValueFilter<const CHUNK_SIZE: usize, N, P>
-where
-    N: Network,
-    P: Provider<N> + Clone,
-{
+const DEFAULT_CHUNK_SIZE: usize = 200;
+const DEFAULT_RETRY_ATTEMPTS: usize = 3;
+const DEFAULT_RETRY_DELAY_SECS: u64 = 10;
+
+#[derive(Debug, Clone)]
+pub struct ValueFilter {
     pub uniswap_v2_factory: Address,
     pub uniswap_v3_factory: Address,
     pub weth: Address,
     pub min_weth_threshold: U256,
-    pub provider: P,
-    phantom: PhantomData<N>,
+    pub provider: DynProvider,
+    pub chunk_size: usize,
 }
 
-impl<const CHUNK_SIZE: usize, N, P> ValueFilter<CHUNK_SIZE, N, P>
-where
-    N: Network,
-    P: Provider<N> + Clone,
-{
-    pub fn new(
+impl ValueFilter {
+    pub fn new<P>(
         uniswap_v2_factory: Address,
         uniswap_v3_factory: Address,
         weth: Address,
         min_weth_threshold: U256,
         provider: P,
-    ) -> Self {
+    ) -> Self
+    where
+        P: Provider<Ethereum> + Clone + 'static,
+    {
         Self {
             uniswap_v2_factory,
             uniswap_v3_factory,
             weth,
             min_weth_threshold,
-            provider,
-            phantom: PhantomData,
+            provider: provider.erased(),
+            chunk_size: DEFAULT_CHUNK_SIZE,
         }
+    }
+
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
     }
 
     pub async fn get_weth_value_in_pools(
         &self,
         pools: Vec<PoolInfo>,
     ) -> Result<HashMap<Address, PoolInfoReturn>, AMMError> {
-        let deployer = WethValueInPoolsBatchRequest::deploy_builder(
-            self.provider.clone(),
-            self.uniswap_v2_factory,
-            self.uniswap_v3_factory,
-            self.weth,
-            pools,
-        );
+        if pools.is_empty() {
+            return Ok(HashMap::new());
+        }
 
-        let res = deployer.call_raw().await?;
-        let return_data = <Vec<PoolInfoReturn> as SolValue>::abi_decode(&res)?;
+        let pool_len = pools.len();
+        println!("About to get weth value in pool for {} pool", pool_len);
 
-        Ok(return_data
-            .into_iter()
-            .map(|pool_info| (pool_info.poolAddress, pool_info))
-            .collect())
+        let provider = self.provider.clone();
+        let uniswap_v2_factory = self.uniswap_v2_factory;
+        let uniswap_v3_factory = self.uniswap_v3_factory;
+        let weth = self.weth;
+        let retry_delay = Duration::from_secs(DEFAULT_RETRY_DELAY_SECS);
+
+        let (batches, _failed_batches) = run_retry_queue(
+            vec![pools],
+            |pools| {
+                let provider = provider.clone();
+                async move {
+                    let deployer = WethValueInPoolsBatchRequest::deploy_builder(
+                        provider,
+                        uniswap_v2_factory,
+                        uniswap_v3_factory,
+                        weth,
+                        pools.clone(),
+                    );
+
+                    match deployer.call_raw().await {
+                        Ok(res) => {
+                            let return_data = <Vec<PoolInfoReturn> as SolValue>::abi_decode(&res)?;
+                            for p in return_data.clone() {
+                                println!("Pool Return: ({}, {}, {})", p.poolType, p.poolAddress, p.wethValue);
+                            }
+                            Ok::<
+                                RetryQueueOutcome<Vec<PoolInfoReturn>, Vec<PoolInfo>>,
+                                AMMError,
+                            >(RetryQueueOutcome::Success(return_data))
+                        }
+                        Err(_err) => Ok::<
+                            RetryQueueOutcome<Vec<PoolInfoReturn>, Vec<PoolInfo>>,
+                            AMMError,
+                        >(RetryQueueOutcome::Retry(pools)),
+                    }
+                }
+            },
+            DEFAULT_RETRY_ATTEMPTS,
+            retry_delay,
+            "state_space::filters::value::get_weth_value_in_pools",
+        )
+        .await?;
+
+        println!("Got weth value in pool");
+
+        let mut pool_info_returns = HashMap::new();
+        for batch in batches {
+            for pool_info in batch {
+                pool_info_returns.insert(pool_info.poolAddress, pool_info);
+            }
+        }
+
+        Ok(pool_info_returns)
     }
 }
 
 #[async_trait]
-impl<const CHUNK_SIZE: usize, N, P> AMMFilter for ValueFilter<CHUNK_SIZE, N, P>
-where
-    N: Network,
-    P: Provider<N> + Clone,
-{
+impl AMMFilter for ValueFilter {
     async fn filter(&self, amms: Vec<AMM>) -> Result<Vec<AMM>, AMMError> {
         let pool_infos = amms
             .iter()
@@ -107,7 +155,7 @@ where
 
         let mut pool_info_returns = HashMap::new();
         let futs = pool_infos
-            .chunks(CHUNK_SIZE)
+            .chunks(self.chunk_size)
             .map(|chunk| async { self.get_weth_value_in_pools(chunk.to_vec()).await })
             .collect::<Vec<_>>();
 

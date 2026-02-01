@@ -380,7 +380,7 @@ pub struct UniswapV2Factory {
 }
 
 impl UniswapV2Factory {
-    const DEFAULT_PAIR_DISCOVERY_RETRY_ATTEMPTS: usize = 5;
+    const DEFAULT_PAIR_DISCOVERY_RETRY_ATTEMPTS: usize = 10;
 
     pub fn new(address: Address, fee: usize, creation_block: u64) -> Self {
         Self {
@@ -419,7 +419,7 @@ impl UniswapV2Factory {
             pairs_length,
             "Getting all pairs"
         );
-        let retry_delay = Duration::from_secs(20);
+        let retry_delay = Duration::from_secs(10);
         let starts = (0..pairs_length).step_by(step).collect::<Vec<_>>();
 
         let (batches, _failed_starts) = run_retry_queue(

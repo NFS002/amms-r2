@@ -156,4 +156,26 @@ macro_rules! amm {
     };
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UniswapPool {
+    V2(UniswapV2Pool),
+    V3(UniswapV3Pool)
+}
+
+impl UniswapPool {
+    pub fn address(&self) -> Address{
+        match self {
+            UniswapPool::V2(pool) => pool.address(),
+            UniswapPool::V3(pool) => pool.address(),
+        }
+    }
+
+    pub fn simulate_swap(&self, base_token: Address, quote_token: Address,amount_in: U256) -> Result<U256, AMMError> {
+        match self {
+            UniswapPool::V2(pool) => pool.simulate_swap(base_token, quote_token, amount_in),
+            UniswapPool::V3(pool) => pool.simulate_swap(base_token, quote_token, amount_in),
+        }
+    }
+}
+
 amm!(UniswapV2Pool, UniswapV3Pool, ERC4626Vault, BalancerPool);

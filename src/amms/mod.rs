@@ -8,6 +8,8 @@ use error::{AMMError, BatchContractError};
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
+use crate::amms::{uniswap_v2::UniswapV2Pool, uniswap_v3::UniswapV3Pool};
+
 pub mod amm;
 pub mod balancer;
 pub mod consts;
@@ -17,6 +19,7 @@ pub mod factory;
 pub mod float;
 pub mod retry_queue;
 pub mod uniswap_v2;
+pub mod path;
 pub mod uniswap_v3;
 
 sol! {
