@@ -72,7 +72,6 @@ impl ValueFilter {
         }
 
         let pool_len = pools.len();
-        println!("About to get weth value in pool for {} pool", pool_len);
 
         let provider = self.provider.clone();
         let uniswap_v2_factory = self.uniswap_v2_factory;
@@ -96,9 +95,6 @@ impl ValueFilter {
                     match deployer.call_raw().await {
                         Ok(res) => {
                             let return_data = <Vec<PoolInfoReturn> as SolValue>::abi_decode(&res)?;
-                            for p in return_data.clone() {
-                                println!("Pool Return: ({}, {}, {})", p.poolType, p.poolAddress, p.wethValue);
-                            }
                             Ok::<
                                 RetryQueueOutcome<Vec<PoolInfoReturn>, Vec<PoolInfo>>,
                                 AMMError,
@@ -117,7 +113,6 @@ impl ValueFilter {
         )
         .await?;
 
-        println!("Got weth value in pool");
 
         let mut pool_info_returns = HashMap::new();
         for batch in batches {
