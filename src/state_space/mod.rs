@@ -18,6 +18,7 @@ use alloy::{
     primitives::{Address, FixedBytes},
     providers::Provider,
 };
+use anyhow::Ok;
 use async_stream::stream;
 use cache::StateChange;
 use cache::StateChangeCache;
@@ -29,6 +30,7 @@ use futures::stream::FuturesUnordered;
 use futures::Stream;
 use futures::StreamExt;
 use std::collections::HashSet;
+use std::fs::read_to_string;
 use std::fs::{exists as file_exists, File};
 use std::ops::Not;
 use std::pin::Pin;
@@ -98,8 +100,8 @@ pub struct StateSpaceBuilder<N, P> {
     pub amms: Vec<AMM>,
     pub filters: Vec<PoolFilter>,
     phantom: PhantomData<N>,
-    input_file: String,
-    output_file: String, // TODO: add support for caching
+    input_file: Option<String>,
+    output_file: Option<String>,
 }
 
 impl<N, P> StateSpaceBuilder<N, P>
@@ -114,8 +116,8 @@ where
             factories: vec![],
             amms: vec![],
             filters: vec![],
-            input_file: String::new(),
-            output_file: String::new(),
+            input_file: Option::None,
+            output_file: Option::None,
             // discovery: false,
             phantom: PhantomData,
         }
@@ -141,24 +143,33 @@ where
     }
 
     pub fn with_input_file(self, input_file: String) -> StateSpaceBuilder<N, P> {
-        StateSpaceBuilder { input_file, ..self }
+        StateSpaceBuilder {
+            input_file: Some(input_file),
+            ..self
+        }
     }
 
     pub fn with_output_file(self, output_file: String) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
-            output_file,
+            output_file: Some(output_file),
             ..self
         }
     }
 
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
-        if !self.input_file.is_empty() {
+        self.input_file.as_deref().and_then(|path| {
             debug!(
                 target: "state_space::sync",
-                input_file = %self.input_file,
+                ?path,
                 "Attempting to sync from input file"
             );
+            let contents = read_to_string(path).map_err(|e| {
 
+            })?;
+            Some(())
+        });
+
+        if !self.input_file.is_empty() {
             amms_file_exists(&self.input_file)?;
             //TODO
         }
