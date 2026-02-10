@@ -31,6 +31,8 @@ pub enum AMMError {
     UnrecognizedEventSignature(FixedBytes<32>),
     #[error(transparent)]
     JoinError(#[from] tokio::task::JoinError),
+    #[error(transparent)]
+    IOError(#[from] IOError),
 }
 
 #[derive(Error, Debug)]
@@ -40,3 +42,12 @@ pub enum BatchContractError {
     #[error(transparent)]
     DynABIError(#[from] alloy::dyn_abi::Error),
 }
+
+#[derive(Error, Debug)]
+pub enum IOError {
+    #[error("File not found")]
+    FileNotFound,
+    #[error("Invalid path")]
+    InvalidPath,
+}
+

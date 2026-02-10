@@ -6,7 +6,9 @@ pub mod filters;
 use crate::amms::amm::AutomatedMarketMaker;
 use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
+use crate::amms::error::IOError;
 use crate::amms::factory::Factory;
+use crate::amms::io::amms_file_exists;
 
 use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
@@ -27,6 +29,8 @@ use futures::stream::FuturesUnordered;
 use futures::Stream;
 use futures::StreamExt;
 use std::collections::HashSet;
+use std::fs::{exists as file_exists, File};
+use std::ops::Not;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -94,7 +98,8 @@ pub struct StateSpaceBuilder<N, P> {
     pub amms: Vec<AMM>,
     pub filters: Vec<PoolFilter>,
     phantom: PhantomData<N>,
-    // TODO: add support for caching
+    input_file: String,
+    output_file: String, // TODO: add support for caching
 }
 
 impl<N, P> StateSpaceBuilder<N, P>
@@ -109,6 +114,8 @@ where
             factories: vec![],
             amms: vec![],
             filters: vec![],
+            input_file: String::new(),
+            output_file: String::new(),
             // discovery: false,
             phantom: PhantomData,
         }
@@ -133,7 +140,29 @@ where
         StateSpaceBuilder { filters, ..self }
     }
 
+    pub fn with_input_file(self, input_file: String) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder { input_file, ..self }
+    }
+
+    pub fn with_output_file(self, output_file: String) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            output_file,
+            ..self
+        }
+    }
+
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
+        if !self.input_file.is_empty() {
+            debug!(
+                target: "state_space::sync",
+                input_file = %self.input_file,
+                "Attempting to sync from input file"
+            );
+
+            amms_file_exists(&self.input_file)?;
+            //TODO
+        }
+
         let sync_start = Instant::now();
         let factories_count = self.factories.len();
         let amms_count = self.amms.len();
@@ -217,7 +246,6 @@ where
             }));
         }
 
-
         let mut state_space = StateSpace::default();
         while let Some(res) = futures.next().await {
             let synced_amms = res??;
@@ -234,6 +262,16 @@ where
                 amm = amm.init(chain_tip, self.provider.clone()).await?;
                 state_space.state.insert(address, amm);
             }
+        }
+
+        if !self.output_file.is_empty() {
+            debug!(
+                target: "state_space::sync",
+                output_file = %self.output_file,
+                "Attempting to sync to output file"
+            );
+            amms_file_exists(&self.output_file)?;
+            // TODO...
         }
 
         let ssm = StateSpaceManager {
