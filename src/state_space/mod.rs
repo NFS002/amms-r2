@@ -10,6 +10,7 @@ use crate::amms::error::AMMError;
 use crate::amms::error::IOError;
 use crate::amms::factory::Factory;
 use crate::amms::io::amms_file_exists;
+use crate::amms::uniswap_v2::UniswapV2Factory;
 
 use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
@@ -107,7 +108,6 @@ pub struct StateSpaceBuilder<N, P> {
     pub amms: Vec<AMM>,
     pub filters: Vec<PoolFilter>,
     phantom: PhantomData<N>,
-    input_file: Option<String>,
     output_file: Option<String>,
 }
 
@@ -123,7 +123,6 @@ where
             factories: vec![],
             amms: vec![],
             filters: vec![],
-            input_file: Option::None,
             output_file: Option::None,
             // discovery: false,
             phantom: PhantomData,
@@ -149,14 +148,26 @@ where
         StateSpaceBuilder { filters, ..self }
     }
 
-    pub fn with_input_file(self, input_file: String) -> StateSpaceBuilder<N, P> {
+    pub fn from_cache(self, input_file: String) -> StateSpaceBuilder<N, P> {
+        debug!(
+            target: "state_space::from_cache",
+            path = %input_file,
+            "Loading amms from cache file"
+        );
+
+        let contents_str = read_to_string(input_file.clone()).unwrap();
+
+        let value = serde_json::from_str::<StateSpaceJSONFile>(contents_str.as_str()).unwrap();
+
+        println!("Loaded {} amms from cache", value.amms.len());
+
         StateSpaceBuilder {
-            input_file: Some(input_file),
+            amms: value.amms.clone(),
             ..self
         }
     }
 
-    pub fn with_output_file(self, output_file: String) -> StateSpaceBuilder<N, P> {
+    pub fn to_cache(self, output_file: String) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             output_file: Some(output_file),
             ..self
@@ -164,25 +175,8 @@ where
     }
 
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
-        // if let Some(path) = self.input_file.as_deref() {
-        //     debug!(
-        //         target: "state_space::sync",
-        //         path = %path,
-        //         "Attempting to sync from input file"
-        //     );
-
-        //     let contents_str =
-        //         read_to_string(path).map_err(|e| AMMError::IOError(IOError::FileNotFound))?;
-
-        //     let values = serde_json::from_str::<StateSpaceJSONFile>(contents_str.as_str())
-        //         .map_err(|e| AMMError::JSONError(e))?;
-
-        //     self.amms.extend(values.amms);
-        // }
-
         let sync_start = Instant::now();
         let factories_count = self.factories.len();
-        let amms_count = self.amms.len();
         let chain_tip = BlockId::from(self.provider.get_block_number().await?);
         let factories = self.factories.clone();
         let mut futures = FuturesUnordered::new();
@@ -273,34 +267,41 @@ where
         }
 
         // Sync remaining AMM variants
-        for (_, remaining_amms) in amm_variants.drain() {
-            for mut amm in remaining_amms {
-                let address = amm.address();
-                amm = amm.init(chain_tip, self.provider.clone()).await?;
-                state_space.state.insert(address, amm);
-            }
+        for (variant, remaining_amms) in amm_variants.drain() {
+            match variant {
+                amms::amm::Variant::UniswapV2Pool => {
+                    info!("Syncing {} UniswapV2 AMMs", remaining_amms.len());
+                    let res = UniswapV2Factory::sync_all_pools(remaining_amms, chain_tip, self.provider.clone(), 5).await?;
+                    for amm in res {
+                        state_space.state.insert(amm.address(), amm);
+                    };
+                },
+                // TODO other variantss
+                _ => info!("Skipping syncing {} AMMs of variant {:?}", remaining_amms.len(), variant),
+            };
+
+            // for mut amm in remaining_amms {
+            //     let address = amm.address();
+            //     amm = amm.init(chain_tip, self.provider.clone()).await?;
+            //     state_space.state.insert(address, amm);
+            // }
         }
 
-        // if !self.output_file.is_empty() {
-        //     debug!(
-        //         target: "state_space::sync",
-        //         output_file = %self.output_file,
-        //         "Attempting to sync to output file"
-        //     );
-        //     amms_file_exists(&self.output_file)?;
-        //     // TODO...
-        // }
+        let new_amms_count = state_space.state.values().cloned().count();
 
         if let Some(path) = self.output_file.as_deref() {
             debug!(
                 target: "state_space::sync",
                 path = %path,
+                amms = %new_amms_count,
                 "Attempting to sync to output file"
             );
 
-            let file = File::create_new(path).inspect_err(|e| {
-                println!("Error creating file at path {}: {:?}", path, e);
-            }).map_err(|e| AMMError::FileError(e))?;
+            let file = File::create_new(path)
+                .inspect_err(|e| {
+                    println!("Error creating file at path {}: {:?}", path, e);
+                })
+                .map_err(|e| AMMError::FileError(e))?;
 
             let amms = state_space.state.values().cloned().collect::<Vec<AMM>>();
 
@@ -309,8 +310,7 @@ where
                 meta: Value::Null,
             };
 
-            serde_json::to_writer(file, &file_contents)
-                .map_err(|e| AMMError::JSONError(e))?;
+            serde_json::to_writer(file, &file_contents).map_err(|e| AMMError::JSONError(e))?;
         }
 
         let ssm = StateSpaceManager {
@@ -325,7 +325,7 @@ where
             target: "state_space::sync",
             elapsed_secs = sync_start.elapsed().as_secs_f32(),
             factories = factories_count,
-            amms = amms_count,
+            amms = new_amms_count,
             "State space sync complete"
         );
 
