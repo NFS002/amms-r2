@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod error;
 pub mod filters;
 
+use crate::amms;
 use crate::amms::amm::AutomatedMarketMaker;
 use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
@@ -18,7 +19,6 @@ use alloy::{
     primitives::{Address, FixedBytes},
     providers::Provider,
 };
-use anyhow::Ok;
 use async_stream::stream;
 use cache::StateChange;
 use cache::StateChangeCache;
@@ -29,6 +29,8 @@ use filters::PoolFilter;
 use futures::stream::FuturesUnordered;
 use futures::Stream;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::read_to_string;
 use std::fs::{exists as file_exists, File};
@@ -52,6 +54,11 @@ pub struct StateSpaceManager<N, P> {
     pub provider: P,
     phantom: PhantomData<N>,
     // TODO: add support for caching
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSpaceJSONFile {
+    amms: Vec<AMM>,
+    meta: Value,
 }
 
 impl<N, P> StateSpaceManager<N, P> {
@@ -157,22 +164,21 @@ where
     }
 
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
-        self.input_file.as_deref().and_then(|path| {
-            debug!(
-                target: "state_space::sync",
-                ?path,
-                "Attempting to sync from input file"
-            );
-            let contents = read_to_string(path).map_err(|e| {
+        // if let Some(path) = self.input_file.as_deref() {
+        //     debug!(
+        //         target: "state_space::sync",
+        //         path = %path,
+        //         "Attempting to sync from input file"
+        //     );
 
-            })?;
-            Some(())
-        });
+        //     let contents_str =
+        //         read_to_string(path).map_err(|e| AMMError::IOError(IOError::FileNotFound))?;
 
-        if !self.input_file.is_empty() {
-            amms_file_exists(&self.input_file)?;
-            //TODO
-        }
+        //     let values = serde_json::from_str::<StateSpaceJSONFile>(contents_str.as_str())
+        //         .map_err(|e| AMMError::JSONError(e))?;
+
+        //     self.amms.extend(values.amms);
+        // }
 
         let sync_start = Instant::now();
         let factories_count = self.factories.len();
@@ -275,14 +281,36 @@ where
             }
         }
 
-        if !self.output_file.is_empty() {
+        // if !self.output_file.is_empty() {
+        //     debug!(
+        //         target: "state_space::sync",
+        //         output_file = %self.output_file,
+        //         "Attempting to sync to output file"
+        //     );
+        //     amms_file_exists(&self.output_file)?;
+        //     // TODO...
+        // }
+
+        if let Some(path) = self.output_file.as_deref() {
             debug!(
                 target: "state_space::sync",
-                output_file = %self.output_file,
+                path = %path,
                 "Attempting to sync to output file"
             );
-            amms_file_exists(&self.output_file)?;
-            // TODO...
+
+            let file = File::create_new(path).inspect_err(|e| {
+                println!("Error creating file at path {}: {:?}", path, e);
+            }).map_err(|e| AMMError::FileError(e))?;
+
+            let amms = state_space.state.values().cloned().collect::<Vec<AMM>>();
+
+            let file_contents = StateSpaceJSONFile {
+                amms,
+                meta: Value::Null,
+            };
+
+            serde_json::to_writer(file, &file_contents)
+                .map_err(|e| AMMError::JSONError(e))?;
         }
 
         let ssm = StateSpaceManager {

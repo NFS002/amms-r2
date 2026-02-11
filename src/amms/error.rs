@@ -4,6 +4,8 @@ use super::{
 };
 use alloy::{primitives::FixedBytes, transports::TransportErrorKind};
 use thiserror::Error;
+use serde_json::Error as JSONError;
+use std::io::Error as FileError;
 
 #[derive(Error, Debug)]
 pub enum AMMError {
@@ -33,6 +35,11 @@ pub enum AMMError {
     JoinError(#[from] tokio::task::JoinError),
     #[error(transparent)]
     IOError(#[from] IOError),
+    #[error(transparent)]
+    FileError(#[from] FileError),
+    #[error(transparent)]
+    JSONError(#[from] JSONError),
+    
 }
 
 #[derive(Error, Debug)]
@@ -49,5 +56,8 @@ pub enum IOError {
     FileNotFound,
     #[error("Invalid path")]
     InvalidPath,
+    #[error("File already exists")]
+    FileAlreadyExists,
+
 }
 
