@@ -1,3 +1,5 @@
+use crate::state_space::filters::value::ValueFilterError;
+
 use super::{
     balancer::BalancerError, erc_4626::ERC4626VaultError, uniswap_v2::UniswapV2Error,
     uniswap_v3::UniswapV3Error,
@@ -39,6 +41,9 @@ pub enum AMMError {
     FileError(#[from] FileError),
     #[error(transparent)]
     JSONError(#[from] JSONError),
+    #[error(transparent)]
+    FilterError(#[from] FilterError),
+
     
 }
 
@@ -59,5 +64,11 @@ pub enum IOError {
     #[error("File already exists")]
     FileAlreadyExists,
 
+}
+
+#[derive(Error, Debug)]
+pub enum FilterError {
+    #[error("ValueFilter Error")]
+    ValueFilterError(#[from] ValueFilterError)
 }
 

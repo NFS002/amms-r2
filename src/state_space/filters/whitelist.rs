@@ -1,5 +1,6 @@
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, AMM},
@@ -8,7 +9,7 @@ use crate::amms::{
 
 use super::{AMMFilter, FilterStage};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolWhitelistFilter {
     pools: Vec<Address>,
 }
@@ -34,7 +35,7 @@ impl AMMFilter for PoolWhitelistFilter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenWhitelistFilter {
     tokens: Vec<Address>,
 }

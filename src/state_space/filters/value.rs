@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use thiserror::Error;
 
 use super::{AMMFilter, FilterStage};
 use crate::amms::{
-    amm::{AutomatedMarketMaker, AMM},
-    error::AMMError,
-    retry_queue::{run_retry_queue, RetryQueueOutcome},
+    amm::{AMM, AutomatedMarketMaker},
+    error::{AMMError, FilterError, IOError},
+    retry_queue::{RetryQueueOutcome, run_retry_queue},
 };
 use alloy::{
     network::Ethereum,
@@ -14,6 +15,8 @@ use alloy::{
     sol_types::SolValue,
 };
 use async_trait::async_trait;
+use eyre::ContextCompat;
+use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 use WethValueInPools::{PoolInfo, PoolInfoReturn};
 
@@ -27,13 +30,16 @@ const DEFAULT_CHUNK_SIZE: usize = 200;
 const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_DELAY_SECS: u64 = 10;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueFilter {
     pub uniswap_v2_factory: Address,
     pub uniswap_v3_factory: Address,
     pub weth: Address,
     pub min_weth_threshold: U256,
-    pub provider: DynProvider,
+
+    #[serde(skip)]
+    pub provider: Option<DynProvider>,
+
     pub chunk_size: usize,
 }
 
@@ -47,13 +53,13 @@ impl ValueFilter {
     ) -> Self
     where
         P: Provider<Ethereum> + Clone + 'static,
-    {
+    { 
         Self {
             uniswap_v2_factory,
             uniswap_v3_factory,
             weth,
             min_weth_threshold,
-            provider: provider.erased(),
+            provider: Some(provider.erased()),
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
@@ -72,12 +78,14 @@ impl ValueFilter {
         }
 
         let pool_len = pools.len();
+        
+        let provider = self.provider.clone().ok_or(AMMError::FilterError(FilterError::ValueFilterError(ValueFilterError::NoProvider)))?;
 
-        let provider = self.provider.clone();
         let uniswap_v2_factory = self.uniswap_v2_factory;
         let uniswap_v3_factory = self.uniswap_v3_factory;
         let weth = self.weth;
         let retry_delay = Duration::from_secs(DEFAULT_RETRY_DELAY_SECS);
+
 
         let (batches, _failed_batches) = run_retry_queue(
             vec![pools],
@@ -176,4 +184,10 @@ impl AMMFilter for ValueFilter {
     fn stage(&self) -> FilterStage {
         FilterStage::Sync
     }
+}
+
+#[derive(Error, Debug)]
+pub enum ValueFilterError {
+    #[error("No provider")]
+    NoProvider
 }

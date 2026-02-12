@@ -1,5 +1,6 @@
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, AMM},
@@ -8,7 +9,7 @@ use crate::amms::{
 
 use super::{AMMFilter, FilterStage};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlacklistFilter {
     /// A blacklist of addresses to exclusively disallow
     blacklist: Vec<Address>,

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use blacklist::BlacklistFilter;
 use value::ValueFilter;
 use whitelist::{PoolWhitelistFilter, TokenWhitelistFilter};
+use serde::{Serialize, Deserialize};
 
 use crate::amms::{amm::AMM, error::AMMError};
 #[async_trait]
@@ -22,7 +23,7 @@ pub enum FilterStage {
 
 macro_rules! filter {
     ($($filter_type:ident),+ $(,)?) => {
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, Serialize, Deserialize)]
         pub enum PoolFilter {
             $($filter_type($filter_type),)+
         }

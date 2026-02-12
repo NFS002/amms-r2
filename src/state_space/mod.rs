@@ -56,10 +56,17 @@ pub struct StateSpaceManager<N, P> {
     phantom: PhantomData<N>,
     // TODO: add support for caching
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheMeta {
+    filters: Vec<PoolFilter>,
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSpaceJSONFile {
     amms: Vec<AMM>,
-    meta: Value,
+    meta: CacheMeta
 }
 
 impl<N, P> StateSpaceManager<N, P> {
@@ -303,11 +310,12 @@ where
                 })
                 .map_err(|e| AMMError::FileError(e))?;
 
+
             let amms = state_space.state.values().cloned().collect::<Vec<AMM>>();
 
             let file_contents = StateSpaceJSONFile {
                 amms,
-                meta: Value::Null,
+                meta: CacheMeta { filters: self.filters.clone() }
             };
 
             serde_json::to_writer(file, &file_contents).map_err(|e| AMMError::JSONError(e))?;
