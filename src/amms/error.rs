@@ -4,10 +4,13 @@ use super::{
     balancer::BalancerError, erc_4626::ERC4626VaultError, uniswap_v2::UniswapV2Error,
     uniswap_v3::UniswapV3Error,
 };
-use alloy::{primitives::FixedBytes, transports::TransportErrorKind};
-use thiserror::Error;
+use alloy::{
+    primitives::{BlockHash, FixedBytes},
+    transports::TransportErrorKind,
+};
 use serde_json::Error as JSONError;
 use std::io::Error as FileError;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AMMError {
@@ -43,8 +46,6 @@ pub enum AMMError {
     JSONError(#[from] JSONError),
     #[error(transparent)]
     FilterError(#[from] FilterError),
-
-    
 }
 
 #[derive(Error, Debug)]
@@ -63,12 +64,21 @@ pub enum IOError {
     InvalidPath,
     #[error("File already exists")]
     FileAlreadyExists,
-
 }
 
 #[derive(Error, Debug)]
 pub enum FilterError {
     #[error("ValueFilter Error")]
-    ValueFilterError(#[from] ValueFilterError)
+    ValueFilterError(#[from] ValueFilterError),
 }
 
+#[derive(Error, Debug)]
+pub enum ReorgError {
+    #[error("Regorg too deep (>{max_depth})")]
+    ReeorgTooDeep { max_depth: u64 },
+    #[error(transparent)]
+    TransportError(#[from] alloy::transports::RpcError<TransportErrorKind>),
+
+    #[error("Missing block for {hash}")]
+    MissingBlock { hash: BlockHash },
+}

@@ -37,12 +37,12 @@ async fn main() -> eyre::Result<()> {
     Under the hood, this method applies all state changes to any affected AMMs and returns a Vec of
     addresses, indicating which AMMs have been updated.
     */
-    let mut stream = state_space_manager.subscribe().await?.take(5);
-    while let Some(updated_amms) = stream.next().await {
-        if let Ok(amms) = updated_amms {
-            println!("Updated AMMs: {:?}", amms);
-        }
-    }
+    // let mut stream = state_space_manager.subscribe().await?.take(5);
+    // while let Some(updated_amms) = stream.next().await {
+    //     if let Ok(amms) = updated_amms {
+    //         println!("Updated AMMs: {:?}", amms);
+    //     }
+    // }
 
     Ok(())
 }

@@ -190,13 +190,10 @@ impl AutomatedMarketMaker for UniswapV2Pool {
             vec![self.address()],
         );
 
-        println!("About to call deploye for pool: {}", self.address());
         let res = deployer.call_raw().block(block_number).await?;
 
         let pool_data =
             <Vec<(Address, Address, u128, u128, u32, u32)> as SolValue>::abi_decode(&res)?[0];
-
-        println!("Pool data: {:?}\n\n", pool_data);
 
         if pool_data.0.is_zero() {
             todo!("Return error");

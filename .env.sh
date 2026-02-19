@@ -1,0 +1,8 @@
+export ETHEREUM_PROVIDER=https://eth-mainnet.g.alchemy.com/v2/9wVG2gQGjihN2FoVRtd6Q
+export WSS_URL=wss://eth-mainnet.g.alchemy.com/v2/9wVG2gQGjihN2FoVRtd6Q
+export CHAIN_ID=137
+export BLOCKNATIVE_TOKEN=
+export PRIVATE_KEY=0xb3e5dc08b18918cce982438a28877e440aafc01fef4c314b95d0609bf946585f
+export SIGNING_KEY=0x34f55bef77aca52be9f7506da40205f8ecd7e863fd3b465a5db9950247422caf
+export BOT_ADDRESS=0xEc1f2DADF368D5a20D494a2974bC19e421812017
+export DUNE_API_KEY=VimH9gJ5pv1xOLnM77AoQrdWg9dcSN9P
