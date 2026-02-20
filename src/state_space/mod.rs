@@ -7,32 +7,31 @@ use crate::amms;
 use crate::amms::amm::AutomatedMarketMaker;
 use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
-use crate::amms::error::IOError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
-use crate::amms::io::amms_file_exists;
+use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
-use crate::amms::uniswap_v2::UniswapV2Pool;
 
 use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
 use alloy::network::primitives::HeaderResponse;
 use alloy::primitives::BlockHash;
 use alloy::primitives::BlockNumber;
+use alloy::primitives::Log;
+use alloy::rpc::types::FilterBlockOption;
 use alloy::rpc::types::{Block, Filter, FilterSet, Log};
 use alloy::{
     network::Network,
     primitives::{Address, FixedBytes},
     providers::Provider,
 };
+use alloy::sol_types::SolEvent;
 use async_stream::stream;
 use cache::StateChange;
 use cache::StateChangeCache;
 use chrono::Local;
 
-use core::num;
 use error::StateSpaceError;
-use eyre::OptionExt;
 use filters::AMMFilter;
 use filters::PoolFilter;
 use futures::stream::FuturesUnordered;
@@ -40,14 +39,10 @@ use futures::Stream;
 use futures::StreamExt;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fs::read_to_string;
-use std::fs::{exists as file_exists, File};
-use std::mem;
-use std::ops::Not;
-use std::os::macos::raw::stat;
+use std::fs::File;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -58,29 +53,38 @@ use tracing::info;
 
 pub const CACHE_SIZE: usize = 30;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Copy)]
+// (reserves0_diff, reserves1_diff)
+type PoolReservesDiff = (isize, isize);
+
+// Map of pool adress -> pool reserves diff
+type PoolDiff = HashMap<Address, PoolReservesDiff>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRef {
     hash: BlockHash,
+    parent_hash: BlockHash,
     number: BlockNumber,
+    diff: PoolDiff
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeadBuffer {
-    block_heads: VecDeque<BlockRef>,
+pub struct BlockBuffer {
+    blocks: VecDeque<BlockRef>,
     capacity: u64,
 }
 
-impl HeadBuffer {
-    pub fn push(&mut self, block_head: BlockRef) {
-        self.block_heads.push_back(block_head);
+impl BlockBuffer {
+    pub fn push(&mut self, block: BlockRef) {
+        self.blocks.push_back(block);
 
-        if self.block_heads.len() > (self.capacity as usize) {
-            self.block_heads.pop_front();
+        if self.blocks.len() > (self.capacity as usize) {
+            self.blocks.pop_front();
         }
     }
 
-    pub fn get_ref_at(&self, index: usize) -> Option<BlockRef> {
-        self.block_heads.get(index).copied()
+    pub fn get_hash_at(&self, index: usize) -> Option<BlockHash> {
+        let b = self.blocks.get(index)?;
+        Some(b.hash.clone())
     }
 }
 
@@ -92,7 +96,7 @@ pub struct StateSpaceManager<N, P> {
     pub block_filter: Filter,
     pub provider: P,
     pub pubsub_provider: P,
-    pub head_buffer: HeadBuffer,
+    pub head_buffer: BlockBuffer,
     phantom: PhantomData<N>,
 }
 
@@ -107,25 +111,24 @@ pub struct StateSpaceJSONFile {
     meta: CacheMeta,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolDiff {
-    foo: usize,
-}
-
-/* Reorg from the closest ancestor({block}, {self.head_buffer.block_heads[0]}) to {block}
+/* Reorg from: closest_ancestor(new_head, self.head_buffer.block_heads[0]) to new_head
  *  - Updates self.head_buffer.block_heads with head_refs of new branch
  *  - Updates self.state and removes pool diffs from pruned branch
  *  - Updates self.state and applied pool diffs of new branch */
 impl<N, P> StateSpaceManager<N, P> {
     pub async fn reorg(
         &mut self,
-        mut block: <N as Network>::HeaderResponse,
+        mut new_head: <N as Network>::HeaderResponse,
     ) -> Result<VecDeque<BlockRef>, StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
         N: Network<BlockResponse = Block>,
     {
-        let mut new_branch: Vec<(BlockRef, PoolDiff)> = Vec::new();
+        let hash = new_head.hash().clone();
+        let parent_hash = new_head.parent_hash().clone();
+        let number = new_head.number();
+        info!(?hash, ?number, target="StateSpaceManager::reorg", "Peforming reorg");
+        let mut new_branch: Vec<BlockRef> = Vec::new();
         let mut depth = 0;
         let max_depth = self.head_buffer.capacity;
 
@@ -134,35 +137,34 @@ impl<N, P> StateSpaceManager<N, P> {
             // 1️⃣ Check if this hash exists in our canonical buffer
             if let Some((idx, _)) = self
                 .head_buffer
-                .block_heads
+                .blocks
                 .iter()
                 .rev()
-                .find_position(|b| b.hash == block.hash())
+                .find_position(|b| b.hash == new_head.hash())
             {
                 // Found common ancestor
-                let pruned_branch = self.head_buffer.block_heads.split_off(idx);
-                pruned_branch.into_iter().for_each(|a| {
-                    //let pool_diff = self.pool_diffs.get_mut(a.hash);
+                info!(?new_head, ?depth, ?idx, target="StateSpaceManager::reorg", "Found common ancestor");
+                let pruned_branch = self.head_buffer.blocks.split_off(idx);
+                pruned_branch.into_iter().for_each(|b| {
+                    let pool_diff = b.diff;
                     //self.revertPoolDiff(a)
                 });
-                new_branch.into_iter().for_each(|(a, b)| {
-                    self.head_buffer.push(a);
-                    //self.pool_diffs.set(a.hash, b);
-                    //self.applyPoolDiff(b);
+                new_branch.into_iter().for_each(|b| {
+                    //self.apply_pool_diff(b.diff);
+                    self.head_buffer.push(b);
                 });
                 return Ok(pruned_branch);
             }
 
-            // 2️⃣ Not found — push this block into new branch
-            // TODO: collect pool reserve diffs per block and apply to new branch
-            new_branch.push_front(block_ref.clone());
+            // Not found — push this block into new branch
+            let diff: PoolDiff = extract_diff_for_block(hash);
+            let block_ref = BlockRef { hash, number, parent_hash, diff };
+            new_branch.push(block_ref);
 
-            // 3️⃣ Fetch parent block via RPC
-            //let parent_hash = block_ref.parent_hash();
-
+            // Fetch parent block via RPC
             let next_block = self
                 .provider
-                .get_block_by_hash(block_ref.hash)
+                .get_block_by_hash(parent_hash)
                 .await
                 .map_err(|e| ReorgError::TransportError(e))?
                 .ok_or(ReorgError::MissingBlock {
@@ -176,6 +178,20 @@ impl<N, P> StateSpaceManager<N, P> {
         }
 
         Err(ReorgError::ReeorgTooDeep { max_depth }.into())
+    }
+
+    pub async fn extract_diff_for_block(&self, block_hash: BlockHash) -> Result<Vec<Log>, StateSpaceError>
+    where
+        P: Provider<N> + Clone + 'static,
+        N: Network<BlockResponse = Block>,
+    {
+        let provider = self.provider.clone();
+        let block_filter = Filter::new()
+            .at_block_hash(block_hash)
+
+            .event_signature(IUniswapV2Pair::Sync::SIGNATURE_HASH);
+        let logs = provider.get_logs(&block_filter).await.map_err(|e| StateSpaceError::TransportError(e))?;
+
     }
 
     pub fn subscribe(
@@ -659,8 +675,8 @@ where
             provider: self.http_provider.clone(),
             pubsub_provider: self.pubsub_provider.clone(),
             phantom: PhantomData,
-            head_buffer: HeadBuffer {
-                block_heads: VecDeque::with_capacity(64),
+            head_buffer: BlockBuffer {
+                blocks: VecDeque::with_capacity(64),
                 capacity: 64,
             },
         };
