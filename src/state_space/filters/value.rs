@@ -3,9 +3,9 @@ use thiserror::Error;
 
 use super::{AMMFilter, FilterStage};
 use crate::amms::{
-    amm::{AMM, AutomatedMarketMaker},
+    amm::{AutomatedMarketMaker, AMM},
     error::{AMMError, FilterError, IOError},
-    retry_queue::{RetryQueueOutcome, run_retry_queue},
+    retry_queue::{run_retry_queue, RetryQueueOutcome},
 };
 use alloy::{
     network::Ethereum,
@@ -53,7 +53,7 @@ impl ValueFilter {
     ) -> Self
     where
         P: Provider<Ethereum> + Clone + 'static,
-    { 
+    {
         Self {
             uniswap_v2_factory,
             uniswap_v3_factory,
@@ -78,14 +78,18 @@ impl ValueFilter {
         }
 
         let pool_len = pools.len();
-        
-        let provider = self.provider.clone().ok_or(AMMError::FilterError(FilterError::ValueFilterError(ValueFilterError::NoProvider)))?;
+
+        let provider =
+            self.provider
+                .clone()
+                .ok_or(AMMError::FilterError(FilterError::ValueFilterError(
+                    ValueFilterError::NoProvider,
+                )))?;
 
         let uniswap_v2_factory = self.uniswap_v2_factory;
         let uniswap_v3_factory = self.uniswap_v3_factory;
         let weth = self.weth;
         let retry_delay = Duration::from_secs(DEFAULT_RETRY_DELAY_SECS);
-
 
         let (batches, _failed_batches) = run_retry_queue(
             vec![pools],
@@ -103,10 +107,9 @@ impl ValueFilter {
                     match deployer.call_raw().await {
                         Ok(res) => {
                             let return_data = <Vec<PoolInfoReturn> as SolValue>::abi_decode(&res)?;
-                            Ok::<
-                                RetryQueueOutcome<Vec<PoolInfoReturn>, Vec<PoolInfo>>,
-                                AMMError,
-                            >(RetryQueueOutcome::Success(return_data))
+                            Ok::<RetryQueueOutcome<Vec<PoolInfoReturn>, Vec<PoolInfo>>, AMMError>(
+                                RetryQueueOutcome::Success(return_data),
+                            )
                         }
                         Err(_err) => Ok::<
                             RetryQueueOutcome<Vec<PoolInfoReturn>, Vec<PoolInfo>>,
@@ -120,7 +123,6 @@ impl ValueFilter {
             "state_space::filters::value::get_weth_value_in_pools",
         )
         .await?;
-
 
         let mut pool_info_returns = HashMap::new();
         for batch in batches {
@@ -189,5 +191,5 @@ impl AMMFilter for ValueFilter {
 #[derive(Error, Debug)]
 pub enum ValueFilterError {
     #[error("No provider")]
-    NoProvider
+    NoProvider,
 }

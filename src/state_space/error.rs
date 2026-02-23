@@ -2,6 +2,7 @@ use alloy::transports::TransportErrorKind;
 use thiserror::Error;
 
 use crate::amms::error::{AMMError, ReorgError};
+use alloy_sol_types::Error as AlloyError;
 
 #[derive(Error, Debug)]
 pub enum StateSpaceError {
@@ -17,4 +18,6 @@ pub enum StateSpaceError {
     ReOrgError(#[from] ReorgError),
     #[error("Missing block at idx={0}")]
     MissingBlockAtIdx(usize),
+    #[error(transparent)]
+    AlloyError(#[from] AlloyError),
 }

@@ -49,6 +49,7 @@ chrono = "0.4.43"
 arc-swap = "1.8.2"
 alloy-consensus = "1.6.3"
 alloy-network = "1.6.3"
+alloy-sol-types = "1.5.7"
 
 
 [dev-dependencies]

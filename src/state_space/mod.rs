@@ -11,21 +11,22 @@ use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
+use crate::amms::uniswap_v3::IUniswapV3PoolEvents;
 
 use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
 use alloy::network::primitives::HeaderResponse;
 use alloy::primitives::BlockHash;
 use alloy::primitives::BlockNumber;
-use alloy::primitives::Log;
+use alloy::primitives::Uint;
 use alloy::rpc::types::FilterBlockOption;
 use alloy::rpc::types::{Block, Filter, FilterSet, Log};
+use alloy::sol_types::SolEvent;
 use alloy::{
     network::Network,
     primitives::{Address, FixedBytes},
     providers::Provider,
 };
-use alloy::sol_types::SolEvent;
 use async_stream::stream;
 use cache::StateChange;
 use cache::StateChangeCache;
@@ -43,9 +44,11 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fs::read_to_string;
 use std::fs::File;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::u128;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -53,18 +56,37 @@ use tracing::info;
 
 pub const CACHE_SIZE: usize = 30;
 
-// (reserves0_diff, reserves1_diff)
-type PoolReservesDiff = (isize, isize);
+#[derive(Clone, Copy, Debug)]
+pub struct PoolReserves {
+    pub r0: u128,
+    pub r1: u128,
+}
 
-// Map of pool adress -> pool reserves diff
-type PoolDiff = HashMap<Address, PoolReservesDiff>;
+impl PoolReserves {
+    pub fn default() -> Self {
+        PoolReserves {
+            r0: u128::MIN,
+            r1: u128::MIN,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PoolDiff {
+    pub topic: FixedBytes<32>,
+    pub address: Address,
+    pub pre: PoolReserves,
+    pub post: PoolReserves,
+}
+
+type AMMBlockDiff = Vec<PoolDiff>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRef {
     hash: BlockHash,
     parent_hash: BlockHash,
     number: BlockNumber,
-    diff: PoolDiff
+    block_diff: AMMBlockDiff,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +149,12 @@ impl<N, P> StateSpaceManager<N, P> {
         let hash = new_head.hash().clone();
         let parent_hash = new_head.parent_hash().clone();
         let number = new_head.number();
-        info!(?hash, ?number, target="StateSpaceManager::reorg", "Peforming reorg");
+        info!(
+            ?hash,
+            ?number,
+            target = "StateSpaceManager::reorg",
+            "Peforming reorg"
+        );
         let mut new_branch: Vec<BlockRef> = Vec::new();
         let mut depth = 0;
         let max_depth = self.head_buffer.capacity;
@@ -143,10 +170,18 @@ impl<N, P> StateSpaceManager<N, P> {
                 .find_position(|b| b.hash == new_head.hash())
             {
                 // Found common ancestor
-                info!(?new_head, ?depth, ?idx, target="StateSpaceManager::reorg", "Found common ancestor");
+                info!(
+                    ?new_head,
+                    ?depth,
+                    ?idx,
+                    target = "StateSpaceManager::reorg",
+                    "Found common ancestor"
+                );
                 let pruned_branch = self.head_buffer.blocks.split_off(idx);
-                pruned_branch.into_iter().for_each(|b| {
-                    let pool_diff = b.diff;
+
+                // Unwind state for pruned branch
+                pruned_branch.into_iter().rev().for_each(|b| {
+                    let pool_diff = b.block_diff;
                     //self.revertPoolDiff(a)
                 });
                 new_branch.into_iter().for_each(|b| {
@@ -157,8 +192,13 @@ impl<N, P> StateSpaceManager<N, P> {
             }
 
             // Not found — push this block into new branch
-            let diff: PoolDiff = extract_diff_for_block(hash);
-            let block_ref = BlockRef { hash, number, parent_hash, diff };
+            let block_diff: AMMBlockDiff = self.extract_block_diff(hash).await?;
+            let block_ref = BlockRef {
+                hash,
+                number,
+                parent_hash,
+                block_diff,
+            };
             new_branch.push(block_ref);
 
             // Fetch parent block via RPC
@@ -180,18 +220,97 @@ impl<N, P> StateSpaceManager<N, P> {
         Err(ReorgError::ReeorgTooDeep { max_depth }.into())
     }
 
-    pub async fn extract_diff_for_block(&self, block_hash: BlockHash) -> Result<Vec<Log>, StateSpaceError>
+    pub async fn extract_block_diff(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<AMMBlockDiff, StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
         N: Network<BlockResponse = Block>,
     {
+        // let block_filter = Filter::new().event_signature(FilterSet::from(
+        //     filter_set.into_iter().collect::<Vec<FixedBytes<32>>>(),
+        // ));
+
+        // Todo get block filter from amm variants
+        let block_filter = self.block_filter.clone().at_block_hash(block_hash);
         let provider = self.provider.clone();
-        let block_filter = Filter::new()
-            .at_block_hash(block_hash)
+        let logs = provider
+            .get_logs(&block_filter)
+            .await
+            .map_err(|e| StateSpaceError::TransportError(e))?;
+        let mut block_diff = AMMBlockDiff::new();
+        let mut state_guard = self.state.write().await;
+        let state = &mut state_guard.state;
 
-            .event_signature(IUniswapV2Pair::Sync::SIGNATURE_HASH);
-        let logs = provider.get_logs(&block_filter).await.map_err(|e| StateSpaceError::TransportError(e))?;
+        for log in logs {
+            let address = log.address();
+            // let amm = match state.get_mut(&address) {
+            //     Some(amm) => amm,
+            //     None => continue, // skip unknown pools instead of erroring
+            // };
 
+            /* If we dont have this AMM, we can discard the log events */
+            let Some(_amm) = state.get(&address) else {
+                continue;
+            };
+
+            match log.topic0() {
+                Some(topic0 @ &IUniswapV2Pair::Sync::SIGNATURE_HASH) => {
+                    let decoded_log = IUniswapV2Pair::Sync::decode_log(&log.inner)
+                        .map_err(|e| StateSpaceError::AlloyError(e))?;
+                    let r0_post = decoded_log.reserve0.to::<u128>();
+                    let r1_post = decoded_log.reserve1.to::<u128>();
+                    let pool_diff = PoolDiff {
+                        topic: *topic0,
+                        address,
+                        pre: PoolReserves::default(),
+                        post: PoolReserves {
+                            r0: r0_post,
+                            r1: r1_post,
+                        },
+                    };
+                    block_diff.push(pool_diff);
+                }
+                _ => unreachable!(),
+            }
+
+            // match amm {
+            //     AMM::UniswapV2Pool(pool) => match log.topic0() {
+            //         Some(topic @ &IUniswapV2Pair::Sync::SIGNATURE_HASH) => {
+            //             let decoded_log = IUniswapV2Pair::Sync::decode_log(&log.inner)
+            //                 .map_err(|e| StateSpaceError::AlloyError(e))?;
+            //             let r0_pre = pool.reserve_0;
+            //             let r1_pre = pool.reserve_1;
+            //             let r0_post = decoded_log.reserve0.to::<u128>();
+            //             let r1_post = decoded_log.reserve1.to::<u128>();
+            //             pool.reserve_0 = r0_post;
+            //             pool.reserve_1 = r1_post;
+            //             let pool_diff = PoolDiff {
+            //                 topic: *topic,
+            //                 address,
+            //                 pre: PoolReserves {
+            //                     r0: r0_pre,
+            //                     r1: r1_pre,
+            //                 },
+            //                 post: PoolReserves {
+            //                     r0: r0_post,
+            //                     r1: r1_post,
+            //                 },
+            //             };
+            //             block_diff.push(pool_diff);
+            //         }
+            //         None => unreachable!(),
+            //         _ => unreachable!(),
+            //     },
+            //     AMM::BalancerPool(pool) => {}
+            //     AMM::UniswapV3Pool(pool) => {}
+            //     // TODO: At the moment, filters are not compatible with vaults
+            //     AMM::ERC4626Vault(pool) => todo!(),
+            //     _ => unreachable!(),
+            // };
+        }
+        Ok(block_diff)
     }
 
     pub fn subscribe(
@@ -216,11 +335,11 @@ impl<N, P> StateSpaceManager<N, P> {
             while let Some(block) = block_stream.next().await {
                 let parent_hash = block.parent_hash();
                 let curr_head = self.head_buffer.get_ref_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
-                if parent_hash != curr_head.hash {
+                //if parent_hash != curr_head.hash {
                     // reorg, rollback to canonical state
-                    let new_head = self.reorg(block);
+                    //let new_head = self.reorg(block);
                     //rollback(new_head)
-                };
+                //};
 
                 //self.head_buffer.push((block_hash, number));
 
