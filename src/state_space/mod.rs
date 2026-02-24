@@ -88,7 +88,7 @@ pub struct BlockRef {
     hash: BlockHash,
     parent_hash: BlockHash,
     number: BlockNumber,
-    block_diff: Option<AMMBlockDiff>
+    block_diff: Option<AMMBlockDiff>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ impl BlockBuffer {
         }
     }
 
-    pub fn get_hash_at(&self, index: usize) -> Option<BlockHash> {
+    pub fn hash_at(&self, index: usize) -> Option<BlockHash> {
         let b = self.blocks.get(index)?;
         Some(b.hash.clone())
     }
@@ -140,18 +140,15 @@ pub struct StateSpaceJSONFile {
  *  - Updates self.state and removes pool diffs from pruned branch
  *  - Updates self.state and applied pool diffs of new branch */
 impl<N, P> StateSpaceManager<N, P> {
-    pub async fn reorg(
-        &mut self,
-        new_head: BlockRef
-    ) -> Option<StateSpaceError>
+    pub async fn reorg(&mut self, new_head: BlockRef) -> Option<StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
         N: Network<BlockResponse = Block>,
     {
-        let mut block_ref = new_head.clone();
-        let hash = block_ref.hash;
-        let parent_hash = block_ref.parent_hash;
-        let number = block_ref.number;
+        let mut next_ref = new_head.clone();
+        let hash = next_ref.hash;
+        let parent_hash = next_ref.parent_hash;
+        let number = next_ref.number;
         info!(
             ?hash,
             ?number,
@@ -174,7 +171,7 @@ impl<N, P> StateSpaceManager<N, P> {
             {
                 // Found common ancestor
                 info!(
-                    ?block_ref,
+                    ?next_ref,
                     ?depth,
                     ?idx,
                     target = "StateSpaceManager::reorg",
@@ -192,7 +189,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     b.block_diff = Some(block_diff);
                     self.head_buffer.push(b);
                 }
-                return None
+                return None;
             }
 
             // Not found — push this block into new branch
@@ -200,7 +197,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 hash,
                 number,
                 parent_hash,
-                block_diff: None
+                block_diff: None,
             });
 
             // Fetch parent block via RPC
@@ -209,19 +206,20 @@ impl<N, P> StateSpaceManager<N, P> {
                 .get_block_by_hash(parent_hash)
                 .await
                 .map_err(|e| ReorgError::TransportError(e))?
-                .ok_or(ReorgError::MissingBlock {
-                    hash: parent_hash
-                })?;
+                .ok_or(ReorgError::MissingBlock { hash: parent_hash })?;
 
-            let Header { hash: next_hash, inner, ..} = next_block.header;
+            let Header {
+                hash: next_hash,
+                inner,
+                ..
+            } = next_block.header;
 
-
-                // TODO implement INTO
-            block_ref = BlockRef {
+            // TODO implement INTO
+            next_ref = BlockRef {
                 hash: next_hash,
                 parent_hash: inner.parent_hash,
                 number: inner.number,
-                block_diff: None
+                block_diff: None,
             }
         }
         Some(ReorgError::ReeorgTooDeep { max_depth }.into())
@@ -233,7 +231,12 @@ impl<N, P> StateSpaceManager<N, P> {
         for pool_diff in diff.iter().rev() {
             match state.get_mut(&pool_diff.address) {
                 Some(AMM::UniswapV2Pool(pool)) => {
-                    debug_assert_eq!(pool_diff.topic, IUniswapV2Pair::Sync::SIGNATURE_HASH, "Pool diff topic ({}) is not IUniswapV2Pair::Sync::SIGNATURE_HASH", pool_diff.topic);
+                    debug_assert_eq!(
+                        pool_diff.topic,
+                        IUniswapV2Pair::Sync::SIGNATURE_HASH,
+                        "Pool diff topic ({}) is not IUniswapV2Pair::Sync::SIGNATURE_HASH",
+                        pool_diff.topic
+                    );
                     pool.reserve_0 = pool_diff.pre.r0;
                     pool.reserve_1 = pool_diff.pre.r1;
                 }
@@ -266,32 +269,30 @@ impl<N, P> StateSpaceManager<N, P> {
             /* If we dont have this AMM, we can discard the log events */
             if let Some(amm) = state.get_mut(&address) {
                 match log.topic0() {
-                    Some(topic0 @ &IUniswapV2Pair::Sync::SIGNATURE_HASH) => {
-                        match amm {
-                            AMM::UniswapV2Pool(pool) => {
-                                let decoded_log = IUniswapV2Pair::Sync::decode_log(&log.inner)
-                                    .map_err(|e| StateSpaceError::AlloyError(e))?;
-                                let r0_post = decoded_log.reserve0.to::<u128>();
-                                let r1_post = decoded_log.reserve1.to::<u128>();
-                                let pool_diff = PoolDiff {
-                                    topic: *topic0,
-                                    address,
-                                    pre: PoolReserves {
-                                        r0: pool.reserve_0,
-                                        r1: pool.reserve_1
-                                    },
-                                    post: PoolReserves {
-                                        r0: r0_post,
-                                        r1: r1_post,
-                                    },
-                                };
-                                pool.reserve_0 = r0_post;
-                                pool.reserve_1 = r1_post;
-                                block_diff.push(pool_diff);
-                            },
-                            _ => unreachable!()
+                    Some(topic0 @ &IUniswapV2Pair::Sync::SIGNATURE_HASH) => match amm {
+                        AMM::UniswapV2Pool(pool) => {
+                            let decoded_log = IUniswapV2Pair::Sync::decode_log(&log.inner)
+                                .map_err(|e| StateSpaceError::AlloyError(e))?;
+                            let r0_post = decoded_log.reserve0.to::<u128>();
+                            let r1_post = decoded_log.reserve1.to::<u128>();
+                            let pool_diff = PoolDiff {
+                                topic: *topic0,
+                                address,
+                                pre: PoolReserves {
+                                    r0: pool.reserve_0,
+                                    r1: pool.reserve_1,
+                                },
+                                post: PoolReserves {
+                                    r0: r0_post,
+                                    r1: r1_post,
+                                },
+                            };
+                            pool.reserve_0 = r0_post;
+                            pool.reserve_1 = r1_post;
+                            block_diff.push(pool_diff);
                         }
-                    }
+                        _ => unreachable!(),
+                    },
                     _ => unreachable!(),
                 }
             }
@@ -302,7 +303,7 @@ impl<N, P> StateSpaceManager<N, P> {
     pub fn subscribe(
         self: Arc<Self>,
     ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send>>,
+        Pin<Box<dyn Stream<Item = Result<BlockRef, StateSpaceError>> + Send>>,
         StateSpaceError,
     >
     where
@@ -316,39 +317,47 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(Box::pin(stream! {
             let block_stream = provider.subscribe_blocks().await?.into_stream();
             tokio::pin!(block_stream);
-            // mut not needed on block_stream if the line above is uncommented
 
             while let Some(block) = block_stream.next().await {
-                let parent_hash = block.parent_hash();
-                let curr_head = self.head_buffer.get_ref_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
-                //if parent_hash != curr_head.hash {
-                    // reorg, rollback to canonical state
-                    //let new_head = self.reorg(block);
-                    //rollback(new_head)
-                //};
+                let curr_hash = self.head_buffer.hash_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
+                let next_hash = block.hash();
+                let next_parent_hash = block.parent_hash();
+                let mut next_head = BlockRef {
+                    hash: next_hash,
+                    parent_hash: next_parent_hash,
+                    number: block.number(),
+                    block_diff: None
+                };
+                if next_parent_hash != curr_hash {
+                    //reorg, rollback to canonical state
+
+
+                    let new_head = self.reorg(next_head);
+                };
 
                 //self.head_buffer.push((block_hash, number));
 
 
 
 
-                let block_number = block.number();
-                let block_hash = block.hash();
-                let block_id = BlockId::from(block_number);
-                if block_id.is_finalized() {
-                    self.resync_from_block(block_id).await?;
-                }
+                // let block_number = block.number();
+                // let block_hash = block.hash();
+                // let block_id = BlockId::from(block_number);
+                // if block_id.is_finalized() {
+                //     self.resync_from_block(block_id).await?;
+                // }
 
-                block_filter = block_filter.select(block_number);
+                //block_filter = block_filter.at_block_hash(next_hash);
+                let block_diff = self.extract_apply_block_diff(next_hash).await?;
+                next_head.block_diff = Some(block_diff);
+                self.head_buffer.push(next_head);
+                //let logs = provider.get_logs(&block_filter).await?;
 
+                // let affected_amms = state.write().await.sync(&logs)?;
+                // let mut latest_block = self.latest_block.write().await;
+                // latest_block = block_hash;
 
-                let logs = provider.get_logs(&block_filter).await?;
-
-                let affected_amms = state.write().await.sync(&logs)?;
-                let mut latest_block = self.latest_block.write().await;
-                latest_block = block_hash;
-
-                yield Ok(affected_amms);
+                yield Ok(next_head);
             }
         }))
     }
