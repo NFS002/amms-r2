@@ -55,10 +55,11 @@ use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::info;
+use tracing::warn;
 
 pub const CACHE_SIZE: usize = 30;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PoolReserves {
     pub r0: u128,
     pub r1: u128,
@@ -73,7 +74,7 @@ impl PoolReserves {
     }
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
 pub struct PoolDiff {
     pub topic: FixedBytes<32>,
     pub address: Address,
@@ -83,12 +84,24 @@ pub struct PoolDiff {
 
 type AMMBlockDiff = Vec<PoolDiff>;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRef {
     hash: BlockHash,
     parent_hash: BlockHash,
     number: BlockNumber,
     block_diff: Option<AMMBlockDiff>,
+}
+
+impl BlockRef {
+    /* Clone without block diff */
+    pub fn shallow_clone(&self) -> Self {
+        Self {
+            hash: self.hash,
+            parent_hash: self.parent_hash,
+            number: self.number,
+            block_diff: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +184,7 @@ impl<N, P> StateSpaceManager<N, P> {
         // ---------------------------
         // Phase 1: Walk backwards via RPC (no lock)
         // ---------------------------
-        let mut cursor = new_head;
+        let mut cursor = new_head.shallow_clone();
         let mut depth = 0usize;
         let mut new_branch_backwards: Vec<BlockRef> = Vec::new();
 
@@ -188,7 +201,7 @@ impl<N, P> StateSpaceManager<N, P> {
             }
 
             if depth >= max_depth {
-                warn!(
+                tracing::error!(
                     ?new_head.hash,
                     ?max_depth,
                     target = "StateSpaceManager::reorg",
@@ -218,7 +231,7 @@ impl<N, P> StateSpaceManager<N, P> {
             {
                 Ok(b) => b,
                 Err(e) => {
-                    error!(
+                    tracing::error!(
                         ?parent_hash,
                         target = "StateSpaceManager::reorg",
                         "Transport error fetching parent block"
@@ -230,7 +243,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let parent_block = match parent_block {
                 Some(b) => b,
                 None => {
-                    error!(
+                    tracing::error!(
                         ?parent_hash,
                         target = "StateSpaceManager::reorg",
                         "Missing parent block during reorg"
@@ -269,7 +282,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let diff: AMMBlockDiff = match self.extract_apply_block_diff(b.hash).await {
                 Ok(d) => d,
                 Err(e) => {
-                    error!(
+                    tracing::error!(
                         ?b.hash,
                         target = "StateSpaceManager::reorg",
                         "Failed to extract/apply block diff"
@@ -317,7 +330,7 @@ impl<N, P> StateSpaceManager<N, P> {
         }
 
         info!(
-            ?new_head.hash,
+            ?new_head,
             target = "StateSpaceManager::reorg",
             "Reorg complete"
         );
@@ -418,7 +431,7 @@ impl<N, P> StateSpaceManager<N, P> {
             tokio::pin!(block_stream);
 
             while let Some(block) = block_stream.next().await {
-                let curr_hash = self.head_buffer.hash_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
+                let curr_hash = self.head_buffer.read().await.hash_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
                 let next_hash = block.hash();
                 let next_parent_hash = block.parent_hash();
                 let mut next_head = BlockRef {
@@ -428,13 +441,12 @@ impl<N, P> StateSpaceManager<N, P> {
                     block_diff: None
                 };
                 if next_parent_hash != curr_hash {
-                    //reorg, rollback to canonical state
-
-
-                    let new_head = self.reorg(next_head);
-                };
-
-                //self.head_buffer.push((block_hash, number));
+                    self.reorg(next_head).await;
+                } else {
+                    let block_diff = self.extract_apply_block_diff(next_hash).await?;
+                    next_head.block_diff = Some(block_diff);
+                    self.head_buffer.write().await.push(next_head);
+                }
 
 
 
@@ -447,14 +459,11 @@ impl<N, P> StateSpaceManager<N, P> {
                 // }
 
                 //block_filter = block_filter.at_block_hash(next_hash);
-                let block_diff = self.extract_apply_block_diff(next_hash).await?;
-                next_head.block_diff = Some(block_diff);
-                self.head_buffer.push(next_head);
                 //let logs = provider.get_logs(&block_filter).await?;
 
                 // let affected_amms = state.write().await.sync(&logs)?;
                 // let mut latest_block = self.latest_block.write().await;
-                // latest_block = block_hash;
+                // latest_block = block_hash;ßß
 
                 yield Ok(next_head);
             }
