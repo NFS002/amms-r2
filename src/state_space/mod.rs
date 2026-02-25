@@ -92,6 +92,17 @@ pub struct BlockRef {
     block_diff: Option<AMMBlockDiff>,
 }
 
+impl From<Header> for BlockRef {
+    fn from(header: Header) -> Self {
+        Self {
+            hash: header.hash,
+            parent_hash: header.inner.parent_hash,
+            number: header.number,
+            block_diff: None,
+        }
+    }
+}
+
 impl BlockRef {
     /* Clone without block diff */
     pub fn shallow_clone(&self) -> Self {
@@ -150,9 +161,10 @@ pub struct StateSpaceJSONFile {
 /* Reorg from: closest_ancestor(new_head, self.head_buffer.block_heads[0]) to new_head
  *  - Updates self.head_buffer.block_heads with head_refs of new branch
  *  - Updates self.state and removes pool diffs from pruned branch
- *  - Updates self.state and applied pool diffs of new branch */
+ *  - Updates self.state and applied pool diffs of new branch
+ *  - Returns a result of <new_head, error> */
 impl<N, P> StateSpaceManager<N, P> {
-    pub async fn reorg(&self, new_head: BlockRef) -> Option<StateSpaceError>
+    pub async fn reorg(&self, new_head: BlockRef) -> Result<BlockRef, StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
         N: Network<BlockResponse = Block>,
@@ -207,12 +219,10 @@ impl<N, P> StateSpaceManager<N, P> {
                     target = "StateSpaceManager::reorg",
                     "Reorg too deep"
                 );
-                return Some(
-                    ReorgError::ReeorgTooDeep {
-                        max_depth: max_depth as u64,
-                    }
-                    .into(),
-                );
+                return Err(ReorgError::ReeorgTooDeep {
+                    max_depth: max_depth as u64,
+                }
+                .into());
             }
 
             new_branch_backwards.push(BlockRef {
@@ -236,7 +246,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         target = "StateSpaceManager::reorg",
                         "Transport error fetching parent block"
                     );
-                    return Some(e.into());
+                    return Err(e.into());
                 }
             };
 
@@ -248,18 +258,11 @@ impl<N, P> StateSpaceManager<N, P> {
                         target = "StateSpaceManager::reorg",
                         "Missing parent block during reorg"
                     );
-                    return Some(ReorgError::MissingBlock { hash: parent_hash }.into());
+                    return Err(ReorgError::MissingBlock { hash: parent_hash }.into());
                 }
             };
 
-            let Header { hash, inner, .. } = parent_block.header;
-
-            cursor = BlockRef {
-                hash,
-                parent_hash: inner.parent_hash,
-                number: inner.number,
-                block_diff: None,
-            };
+            cursor = parent_block.header.into();
 
             depth += 1;
         };
@@ -287,7 +290,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         target = "StateSpaceManager::reorg",
                         "Failed to extract/apply block diff"
                     );
-                    return Some(e);
+                    return Err(e);
                 }
             };
             b.block_diff = Some(diff);
@@ -296,7 +299,7 @@ impl<N, P> StateSpaceManager<N, P> {
         // ---------------------------
         // Phase 2: Commit (short write lock)
         // ---------------------------
-        {
+        let head = {
             let mut guard = self.head_buffer.write().await;
 
             let ancestor_idx_now = guard
@@ -324,17 +327,16 @@ impl<N, P> StateSpaceManager<N, P> {
             }
 
             // Append new branch
+            let head = new_branch.last().cloned();
             for b in new_branch {
                 guard.blocks.push_back(b);
             }
-        }
 
-        info!(
-            ?new_head,
-            target = "StateSpaceManager::reorg",
-            "Reorg complete"
-        );
-        None
+            head.unwrap()
+        };
+
+        info!(?head, target = "StateSpaceManager::reorg", "Reorg complete");
+        Ok(head)
     }
 
     pub async fn revert_block_diff(&self, diff: AMMBlockDiff) -> Option<StateSpaceError> {
@@ -421,49 +423,27 @@ impl<N, P> StateSpaceManager<N, P> {
     where
         P: Provider<N> + Clone + 'static,
         N: Network<BlockResponse = Block>,
+        BlockRef: From<<N as Network>::HeaderResponse>,
     {
         let provider = self.pubsub_provider.clone();
-        let state = self.state.clone();
-        let mut block_filter = self.block_filter.clone();
 
         Ok(Box::pin(stream! {
             let block_stream = provider.subscribe_blocks().await?.into_stream();
             tokio::pin!(block_stream);
 
-            while let Some(block) = block_stream.next().await {
+            while let Some(next_block) = block_stream.next().await {
                 let curr_hash = self.head_buffer.read().await.hash_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
-                let next_hash = block.hash();
-                let next_parent_hash = block.parent_hash();
-                let mut next_head = BlockRef {
-                    hash: next_hash,
-                    parent_hash: next_parent_hash,
-                    number: block.number(),
-                    block_diff: None
-                };
-                if next_parent_hash != curr_hash {
-                    self.reorg(next_head).await;
+            // let <N as Network>::HeaderResponse { hash: next_hash, parent_hash: next_parent_hash } = next_block;
+                let mut block_ref: BlockRef = next_block.into();
+                let BlockRef { hash: next_hash, parent_hash: next_parent_hash, .. } = block_ref;
+                let next_head: BlockRef = if next_parent_hash != curr_hash {                    
+                  self.reorg(block_ref).await?
                 } else {
                     let block_diff = self.extract_apply_block_diff(next_hash).await?;
-                    next_head.block_diff = Some(block_diff);
-                    self.head_buffer.write().await.push(next_head);
-                }
-
-
-
-
-                // let block_number = block.number();
-                // let block_hash = block.hash();
-                // let block_id = BlockId::from(block_number);
-                // if block_id.is_finalized() {
-                //     self.resync_from_block(block_id).await?;
-                // }
-
-                //block_filter = block_filter.at_block_hash(next_hash);
-                //let logs = provider.get_logs(&block_filter).await?;
-
-                // let affected_amms = state.write().await.sync(&logs)?;
-                // let mut latest_block = self.latest_block.write().await;
-                // latest_block = block_hash;ßß
+                    block_ref.block_diff = Some(block_diff);
+                    self.head_buffer.write().await.push(block_ref.clone());
+                    block_ref
+                };
 
                 yield Ok(next_head);
             }
