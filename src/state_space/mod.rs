@@ -73,7 +73,7 @@ impl PoolReserves {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy)]
 pub struct PoolDiff {
     pub topic: FixedBytes<32>,
     pub address: Address,
@@ -83,7 +83,7 @@ pub struct PoolDiff {
 
 type AMMBlockDiff = Vec<PoolDiff>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BlockRef {
     hash: BlockHash,
     parent_hash: BlockHash,
@@ -116,11 +116,10 @@ impl BlockBuffer {
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
     pub latest_block: Arc<RwLock<BlockHash>>,
-    // discovery_manager: Option<DiscoveryManager>,
     pub block_filter: Filter,
     pub provider: P,
     pub pubsub_provider: P,
-    pub head_buffer: BlockBuffer,
+    pub head_buffer: Arc<RwLock<BlockBuffer>>,
     phantom: PhantomData<N>,
 }
 
@@ -140,89 +139,189 @@ pub struct StateSpaceJSONFile {
  *  - Updates self.state and removes pool diffs from pruned branch
  *  - Updates self.state and applied pool diffs of new branch */
 impl<N, P> StateSpaceManager<N, P> {
-    pub async fn reorg(&mut self, new_head: BlockRef) -> Option<StateSpaceError>
+    pub async fn reorg(&self, new_head: BlockRef) -> Option<StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
         N: Network<BlockResponse = Block>,
     {
-        let mut next_ref = new_head.clone();
-        let hash = next_ref.hash;
-        let parent_hash = next_ref.parent_hash;
-        let number = next_ref.number;
-        info!(
-            ?hash,
-            ?number,
-            target = "StateSpaceManager::reorg",
-            "Peforming reorg"
-        );
-        let mut new_branch: Vec<BlockRef> = Vec::new();
-        let mut depth = 0;
-        let max_depth = self.head_buffer.capacity;
+        let provider = self.provider.clone();
 
-        while depth < max_depth {
-            depth += 1;
-            // 1️⃣ Check if this hash exists in our canonical buffer
-            if let Some((idx, _)) = self
-                .head_buffer
-                .blocks
-                .iter()
-                .rev()
-                .find_position(|b| b.hash == hash)
-            {
-                // Found common ancestor
+        info!(
+            ?new_head.hash,
+            ?new_head.number,
+            target = "StateSpaceManager::reorg",
+            "Starting reorg"
+        );
+
+        // ---------------------------
+        // Phase 0: Snapshot canonical state (short read lock)
+        // ---------------------------
+        let (max_depth, canonical_hashes) = {
+            let guard = self.head_buffer.read().await;
+
+            let max_depth = guard.capacity as usize;
+
+            let hashes: Vec<_> = guard.blocks.iter().map(|b| b.hash).collect();
+
+            (max_depth, hashes)
+        };
+
+        let find_ancestor = |hash| canonical_hashes.iter().position(|&h| h == hash);
+
+        // ---------------------------
+        // Phase 1: Walk backwards via RPC (no lock)
+        // ---------------------------
+        let mut cursor = new_head;
+        let mut depth = 0usize;
+        let mut new_branch_backwards: Vec<BlockRef> = Vec::new();
+
+        let (ancestor_idx_snapshot, ancestor_hash) = loop {
+            if let Some(idx) = find_ancestor(cursor.hash) {
                 info!(
-                    ?next_ref,
+                    ?cursor.hash,
                     ?depth,
                     ?idx,
                     target = "StateSpaceManager::reorg",
                     "Found common ancestor"
                 );
-                let pruned_branch = self.head_buffer.blocks.split_off(idx);
-
-                for b in pruned_branch.into_iter().rev() {
-                    // Should be: state.revert_block_diff(...)
-                    let diff = b.block_diff.expect("AMM block diff should exist");
-                    self.revert_block_diff(diff);
-                }
-                for mut b in new_branch.into_iter() {
-                    let block_diff: AMMBlockDiff = self.extract_apply_block_diff(b.hash).await?;
-                    b.block_diff = Some(block_diff);
-                    self.head_buffer.push(b);
-                }
-                return None;
+                break (idx, cursor.hash);
             }
 
-            // Not found — push this block into new branch
-            new_branch.push(BlockRef {
-                hash,
-                number,
-                parent_hash,
+            if depth >= max_depth {
+                warn!(
+                    ?new_head.hash,
+                    ?max_depth,
+                    target = "StateSpaceManager::reorg",
+                    "Reorg too deep"
+                );
+                return Some(
+                    ReorgError::ReeorgTooDeep {
+                        max_depth: max_depth as u64,
+                    }
+                    .into(),
+                );
+            }
+
+            new_branch_backwards.push(BlockRef {
+                hash: cursor.hash,
+                parent_hash: cursor.parent_hash,
+                number: cursor.number,
                 block_diff: None,
             });
 
-            // Fetch parent block via RPC
-            let next_block = self
-                .provider
+            let parent_hash = cursor.parent_hash;
+
+            let parent_block = match provider
                 .get_block_by_hash(parent_hash)
                 .await
-                .map_err(|e| ReorgError::TransportError(e))?
-                .ok_or(ReorgError::MissingBlock { hash: parent_hash })?;
+                .map_err(|e| ReorgError::TransportError(e))
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(
+                        ?parent_hash,
+                        target = "StateSpaceManager::reorg",
+                        "Transport error fetching parent block"
+                    );
+                    return Some(e.into());
+                }
+            };
 
-            let Header {
-                hash: next_hash,
-                inner,
-                ..
-            } = next_block.header;
+            let parent_block = match parent_block {
+                Some(b) => b,
+                None => {
+                    error!(
+                        ?parent_hash,
+                        target = "StateSpaceManager::reorg",
+                        "Missing parent block during reorg"
+                    );
+                    return Some(ReorgError::MissingBlock { hash: parent_hash }.into());
+                }
+            };
 
-            // TODO implement INTO
-            next_ref = BlockRef {
-                hash: next_hash,
+            let Header { hash, inner, .. } = parent_block.header;
+
+            cursor = BlockRef {
+                hash,
                 parent_hash: inner.parent_hash,
                 number: inner.number,
                 block_diff: None,
+            };
+
+            depth += 1;
+        };
+
+        // Convert backward branch to forward order
+        let mut new_branch = new_branch_backwards;
+        new_branch.reverse();
+
+        info!(
+            new_branch_len = new_branch.len(),
+            ?ancestor_hash,
+            target = "StateSpaceManager::reorg",
+            "Computed new branch"
+        );
+
+        // ---------------------------
+        // Phase 1b: Compute diffs (no lock)
+        // ---------------------------
+        for b in &mut new_branch {
+            let diff: AMMBlockDiff = match self.extract_apply_block_diff(b.hash).await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!(
+                        ?b.hash,
+                        target = "StateSpaceManager::reorg",
+                        "Failed to extract/apply block diff"
+                    );
+                    return Some(e);
+                }
+            };
+            b.block_diff = Some(diff);
+        }
+
+        // ---------------------------
+        // Phase 2: Commit (short write lock)
+        // ---------------------------
+        {
+            let mut guard = self.head_buffer.write().await;
+
+            let ancestor_idx_now = guard
+                .blocks
+                .iter()
+                .position(|b| b.hash == ancestor_hash)
+                .unwrap_or(ancestor_idx_snapshot);
+
+            let split_point = ancestor_idx_now + 1;
+
+            let mut pruned = guard.blocks.split_off(split_point);
+            let pruned_len = pruned.len();
+
+            info!(
+                pruned_len,
+                new_branch_len = new_branch.len(),
+                target = "StateSpaceManager::reorg",
+                "Applying reorg changes"
+            );
+
+            // Revert canonical blocks from tip backwards
+            while let Some(b) = pruned.pop_back() {
+                let diff = b.block_diff.expect("Canonical block must have diff");
+                self.revert_block_diff(diff);
+            }
+
+            // Append new branch
+            for b in new_branch {
+                guard.blocks.push_back(b);
             }
         }
-        Some(ReorgError::ReeorgTooDeep { max_depth }.into())
+
+        info!(
+            ?new_head.hash,
+            target = "StateSpaceManager::reorg",
+            "Reorg complete"
+        );
+        None
     }
 
     pub async fn revert_block_diff(&self, diff: AMMBlockDiff) -> Option<StateSpaceError> {
