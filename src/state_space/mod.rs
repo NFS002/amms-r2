@@ -432,10 +432,9 @@ impl<N, P> StateSpaceManager<N, P> {
 
             while let Some(next_block) = block_stream.next().await {
                 let curr_hash = self.head_buffer.read().await.hash_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
-            // let <N as Network>::HeaderResponse { hash: next_hash, parent_hash: next_parent_hash } = next_block;
                 let mut block_ref: BlockRef = next_block.into();
                 let BlockRef { hash: next_hash, parent_hash: next_parent_hash, .. } = block_ref;
-                let next_head: BlockRef = if next_parent_hash != curr_hash {                    
+                let next_head: BlockRef = if next_parent_hash != curr_hash {
                   self.reorg(block_ref).await?
                 } else {
                     let block_diff = self.extract_apply_block_diff(next_hash).await?;
@@ -876,7 +875,7 @@ where
             head_buffer: Arc::new(RwLock::new(BlockBuffer {
                 blocks: VecDeque::with_capacity(64),
                 capacity: 64,
-            }))
+            })),
         };
 
         info!(
