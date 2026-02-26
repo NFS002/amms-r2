@@ -139,7 +139,6 @@ impl BlockBuffer {
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
-    pub latest_block: Arc<RwLock<BlockHash>>,
     pub block_filter: Filter,
     pub provider: P,
     pub pubsub_provider: P,
@@ -461,7 +460,6 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network<BlockResponse = Block>,
     {
         let provider = self.pubsub_provider.clone();
-        let latest_block = self.latest_block.clone();
         let state = self.state.clone();
         let mut block_filter = self.block_filter.clone();
 
@@ -479,7 +477,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 let logs = provider.get_logs(&block_filter).await?;
 
                 let affected_amms = state.write().await.sync(&logs)?;
-                latest_block.store(block_number, Ordering::Relaxed);
 
                 yield Ok(affected_amms);
             }
@@ -871,16 +868,15 @@ where
         }
 
         let ssm = StateSpaceManager {
-            latest_block: Arc::new(AtomicU64::new(self.latest_block)),
             state: Arc::new(RwLock::new(state_space)),
             block_filter,
             provider: self.http_provider.clone(),
             pubsub_provider: self.pubsub_provider.clone(),
             phantom: PhantomData,
-            head_buffer: BlockBuffer {
+            head_buffer: Arc::new(RwLock::new(BlockBuffer {
                 blocks: VecDeque::with_capacity(64),
                 capacity: 64,
-            },
+            }))
         };
 
         info!(
