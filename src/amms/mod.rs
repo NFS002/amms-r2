@@ -22,6 +22,7 @@ pub mod retry_queue;
 pub mod uniswap_v2;
 pub mod path;
 pub mod uniswap_v3;
+pub mod formatters;
 
 sol! {
     #[sol(rpc)]

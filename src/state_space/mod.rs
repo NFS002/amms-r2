@@ -9,6 +9,7 @@ use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
+use crate::amms::formatters::debug_formatters::short_hash;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
@@ -44,6 +45,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs::read_to_string;
 use std::fs::File;
 use std::ops::ControlFlow;
@@ -84,7 +86,7 @@ pub struct PoolDiff {
 
 type AMMBlockDiff = Vec<PoolDiff>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BlockRef {
     hash: BlockHash,
     parent_hash: BlockHash,
@@ -103,6 +105,27 @@ impl From<Header> for BlockRef {
     }
 }
 
+impl fmt::Display for BlockRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let h = short_hash(&self.hash);
+        let ph = short_hash(&self.parent_hash);
+        writeln!(f, "BlockRef ({}): {} -> {}", self.number, h, ph)?;
+        let length = self.block_diff.iter().len();
+        write!(f, "Pools affected: {}", length)
+    }
+}
+
+impl fmt::Debug for BlockRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let h = short_hash(&self.hash);
+        let ph = short_hash(&self.parent_hash);
+        writeln!(f, "BlockRef ({}): {} -> {}", self.number, h, ph)?;
+        let length = self.block_diff.iter().len();
+        writeln!(f, "Pools affected: {}", length)?;
+        f.debug_set().entries(self.block_diff.clone()).finish()
+    }
+}
+
 impl BlockRef {
     /* Clone without block diff */
     pub fn shallow_clone(&self) -> Self {
@@ -115,7 +138,7 @@ impl BlockRef {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BlockBuffer {
     blocks: VecDeque<BlockRef>,
     capacity: u64,
@@ -133,6 +156,15 @@ impl BlockBuffer {
     pub fn hash_at(&self, index: usize) -> Option<BlockHash> {
         let b = self.blocks.get(index)?;
         Some(b.hash.clone())
+    }
+}
+
+impl fmt::Debug for BlockBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "BlockBuffer ({}/{})", self.blocks.len(), self.capacity)
+        for block_ref in this.blocks {
+            writeln!(f, "{}", block_ref.);
+        }
     }
 }
 
