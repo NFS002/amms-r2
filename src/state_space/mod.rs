@@ -9,7 +9,7 @@ use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
-use crate::amms::formatters::debug_formatters::short_hash;
+use crate::amms::formatters::debug_formatters::short_str;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
@@ -76,12 +76,22 @@ impl PoolReserves {
     }
 }
 
-#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PoolDiff {
     pub topic: FixedBytes<32>,
+    pub topic_name: String,
     pub address: Address,
     pub pre: PoolReserves,
     pub post: PoolReserves,
+}
+
+impl fmt::Display for PoolDiff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let addr = short_str(&self.address);
+        writeln!(f, "PoolDiff for {}:", addr);
+        writeln!(f, "  Topic: {}", self.topic_name);
+        writeln!(f, "    ({}, {}) -> ({}, {})", self.pre.r0, self.pre.r1, self.post.r0, self.post.r1)
+    }
 }
 
 type AMMBlockDiff = Vec<PoolDiff>;
@@ -107,8 +117,8 @@ impl From<Header> for BlockRef {
 
 impl fmt::Display for BlockRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let h = short_hash(&self.hash);
-        let ph = short_hash(&self.parent_hash);
+        let h = short_str(&self.hash);
+        let ph = short_str(&self.parent_hash);
         writeln!(f, "BlockRef ({}): {} -> {}", self.number, h, ph)?;
         let length = self.block_diff.iter().len();
         write!(f, "Pools affected: {}", length)
@@ -117,12 +127,18 @@ impl fmt::Display for BlockRef {
 
 impl fmt::Debug for BlockRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let h = short_hash(&self.hash);
-        let ph = short_hash(&self.parent_hash);
+        let h = short_str(&self.hash);
+        let ph = short_str(&self.parent_hash);
         writeln!(f, "BlockRef ({}): {} -> {}", self.number, h, ph)?;
         let length = self.block_diff.iter().len();
         writeln!(f, "Pools affected: {}", length)?;
-        f.debug_set().entries(self.block_diff.clone()).finish()
+        if self.block_diff.is_some() {
+            let first_pools = self.block_diff.unwrap().as_ref().take(3);
+            for p in first_pools {
+                writeln!(f, "{}", p)?;
+            }
+        }
+        f.write_str("\n")
     }
 }
 

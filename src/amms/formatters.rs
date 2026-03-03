@@ -1,13 +1,15 @@
 pub mod debug_formatters {
-    use alloy::primitives::BlockHash;
 
-    pub fn short_hash(b: &BlockHash) -> String {
-        let full_hash = b.to_string();
-        let mut iter = full_hash.chars();
+    pub fn short_str<T: ToString>(b: T) -> String {
+        let full_str = b.to_string();
+        if full_str.len() <= 7 {
+            return full_str;
+        };
+        let mut iter = full_str.chars();
 
         let first: String = iter.by_ref().take(3).collect();
 
-        let last: String = full_hash
+        let last: String = full_str
         .to_string()
             .chars()
             .rev()
@@ -17,6 +19,6 @@ pub mod debug_formatters {
             .rev()
             .collect();
 
-        format!("{}...{}", first, last)
+        format!("{}..{}", first, last)
     }
 }
