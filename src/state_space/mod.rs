@@ -9,7 +9,7 @@ use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
-use crate::amms::formatters::debug_formatters::short_str;
+use crate::amms::formatters::debug_formatters::{short_str, debug_block_ref};
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
@@ -98,10 +98,10 @@ type AMMBlockDiff = Vec<PoolDiff>;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BlockRef {
-    hash: BlockHash,
-    parent_hash: BlockHash,
-    number: BlockNumber,
-    block_diff: Option<AMMBlockDiff>,
+    pub hash: BlockHash,
+    pub parent_hash: BlockHash,
+    pub number: BlockNumber,
+    pub block_diff: Option<AMMBlockDiff>,
 }
 
 impl From<Header> for BlockRef {
@@ -127,6 +127,7 @@ impl fmt::Display for BlockRef {
 
 impl fmt::Debug for BlockRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        //let p = fmt::Formatter::new();
         let h = short_str(&self.hash);
         let ph = short_str(&self.parent_hash);
         writeln!(f, "BlockRef ({}): {} -> {}", self.number, h, ph)?;
