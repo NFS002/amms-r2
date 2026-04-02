@@ -1,7 +1,7 @@
 pub mod debug_formatters {
     use std::fmt;
 
-    use crate::state_space::BlockRef;
+    use crate::state_space::{BlockBuffer, BlockRef};
 
     pub fn short_str<T: ToString>(b: T) -> String {
         let full_str = b.to_string();
@@ -25,18 +25,31 @@ pub mod debug_formatters {
         format!("{}..{}", first, last)
     }
 
-    fn debug_block_ref(block_ref: &BlockRef, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    pub fn dbg_block_ref(block_ref: &BlockRef, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let h = short_str(block_ref.hash);
         let ph = short_str(block_ref.parent_hash);
-        writeln!(f, "BlockRef ({}): {} -> {}", block_ref.number, h, ph)?;
-        let length = block_ref.block_diff.iter().len();
+        writeln!(f, "BlockRef ({}): {} -> {}", block_ref.number, ph, h)?;
+        let length = block_ref.block_diff.as_ref().map(|d| d.len()).unwrap_or(0);
         writeln!(f, "Pools affected: {}", length)?;
-        if block_ref.block_diff.is_some() && f.alternate() {
-            let first_pools = block_ref.block_diff.as_ref().unwrap().into_iter().take(3);
-            for p in first_pools {
-                writeln!(f, "{}", p)?;
+        if f.alternate() {
+            if let Some(diff) = &block_ref.block_diff {
+                for p in diff.iter().take(3) {
+                    fmt_prefix(f, p, "\t")?;
+                }
             }
         }
         f.write_str("\n")
+    }
+
+    pub fn fmt_prefix<T: std::fmt::Debug>(
+        f: &mut fmt::Formatter<'_>,
+        value: &T,
+        prefix: &str,
+    ) -> fmt::Result {
+        let s = format!("{:?}", value);
+        for line in s.lines() {
+            writeln!(f, "{}{}", prefix, line)?;
+        }
+        Ok(())
     }
 }

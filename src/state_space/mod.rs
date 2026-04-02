@@ -2,6 +2,7 @@ pub mod cache;
 pub mod discovery;
 pub mod error;
 pub mod filters;
+pub mod reorg;
 
 use crate::amms;
 use crate::amms::amm::AutomatedMarketMaker;
@@ -9,7 +10,8 @@ use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
-use crate::amms::formatters::debug_formatters::{short_str, debug_block_ref};
+use crate::amms::formatters::debug_formatters::fmt_prefix;
+use crate::amms::formatters::debug_formatters::{dbg_block_ref, short_str};
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
@@ -46,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt;
+use std::fmt::Debug;
 use std::fs::read_to_string;
 use std::fs::File;
 use std::ops::ControlFlow;
@@ -85,12 +88,28 @@ pub struct PoolDiff {
     pub post: PoolReserves,
 }
 
-impl fmt::Display for PoolDiff {
+impl PoolDiff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let addr = short_str(&self.address);
-        writeln!(f, "PoolDiff for {}:", addr);
-        writeln!(f, "  Topic: {}", self.topic_name);
-        writeln!(f, "    ({}, {}) -> ({}, {})", self.pre.r0, self.pre.r1, self.post.r0, self.post.r1)
+        writeln!(f, "PoolDiff for {}:", addr)?;
+        fmt_prefix(f, &self.topic_name, "\t")?;
+        let args = format_args!(
+            "({}, {}) -> ({}, {})",
+            self.pre.r0, self.pre.r1, self.post.r0, self.post.r1
+        );
+        fmt_prefix(f, &args, "\t")
+    }
+}
+
+impl fmt::Display for PoolDiff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
+    }
+}
+
+impl fmt::Debug for PoolDiff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
     }
 }
 
@@ -117,29 +136,13 @@ impl From<Header> for BlockRef {
 
 impl fmt::Display for BlockRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let h = short_str(&self.hash);
-        let ph = short_str(&self.parent_hash);
-        writeln!(f, "BlockRef ({}): {} -> {}", self.number, h, ph)?;
-        let length = self.block_diff.iter().len();
-        write!(f, "Pools affected: {}", length)
+        dbg_block_ref(self, f)
     }
 }
 
 impl fmt::Debug for BlockRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        //let p = fmt::Formatter::new();
-        let h = short_str(&self.hash);
-        let ph = short_str(&self.parent_hash);
-        writeln!(f, "BlockRef ({}): {} -> {}", self.number, h, ph)?;
-        let length = self.block_diff.iter().len();
-        writeln!(f, "Pools affected: {}", length)?;
-        if self.block_diff.is_some() {
-            let first_pools = self.block_diff.unwrap().as_ref().take(3);
-            for p in first_pools {
-                writeln!(f, "{}", p)?;
-            }
-        }
-        f.write_str("\n")
+        dbg_block_ref(self, f)
     }
 }
 
@@ -157,8 +160,8 @@ impl BlockRef {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct BlockBuffer {
-    blocks: VecDeque<BlockRef>,
-    capacity: u64,
+    pub blocks: VecDeque<BlockRef>,
+    pub capacity: u64,
 }
 
 impl BlockBuffer {
@@ -170,18 +173,47 @@ impl BlockBuffer {
         }
     }
 
-    pub fn hash_at(&self, index: usize) -> Option<BlockHash> {
-        let b = self.blocks.get(index)?;
-        Some(b.hash.clone())
+    pub fn head(&self) -> Option<BlockRef> {
+        let b = self.blocks.iter().last();
+        b.cloned()
+    }
+
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self.blocks.len();
+        writeln!(f, "BlockBuffer ({}/{})", len, self.capacity)?;
+
+        match len {
+            0..=4 => {
+                for block in &self.blocks {
+                    fmt_prefix(f, block, "\t")?;
+                }
+            }
+            _ => {
+                for block in self.blocks.iter().take(2) {
+                    fmt_prefix(f, block, "\t")?;
+                }
+
+                writeln!(f, "\t...")?;
+
+                for block in self.blocks.iter().skip(len - 2) {
+                    fmt_prefix(f, block, "\t")?;
+                }
+            }
+        }
+
+        writeln!(f, "----End of BlockBuffer----")
     }
 }
 
 impl fmt::Debug for BlockBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "BlockBuffer ({}/{})", self.blocks.len(), self.capacity)
-        for block_ref in this.blocks {
-            writeln!(f, "{}", block_ref.);
-        }
+        self.fmt(f)
+    }
+}
+
+impl fmt::Display for BlockBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
     }
 }
 
@@ -438,6 +470,7 @@ impl<N, P> StateSpaceManager<N, P> {
                             let r0_post = decoded_log.reserve0.to::<u128>();
                             let r1_post = decoded_log.reserve1.to::<u128>();
                             let pool_diff = PoolDiff {
+                                topic_name: IUniswapV2Pair::Sync::SIGNATURE.to_string(),
                                 topic: *topic0,
                                 address,
                                 pre: PoolReserves {
@@ -480,12 +513,19 @@ impl<N, P> StateSpaceManager<N, P> {
             tokio::pin!(block_stream);
 
             while let Some(next_block) = block_stream.next().await {
-                let curr_hash = self.head_buffer.read().await.hash_at(0).ok_or(StateSpaceError::MissingBlockAtIdx(0))?;
+                println!(
+                "Next: block: {:?}, number: {}\n\n\n",
+                    next_block.hash(), next_block.number()
+                );
+                println!("{:#?}", self.head_buffer.read().await);
                 let mut block_ref: BlockRef = next_block.into();
                 let BlockRef { hash: next_hash, parent_hash: next_parent_hash, .. } = block_ref;
+                let curr_hash = self.head_buffer.read().await.head().map(|b| b.hash).unwrap_or(next_parent_hash);
                 let next_head: BlockRef = if next_parent_hash != curr_hash {
+                  println!("Performing reorg");
                   self.reorg(block_ref).await?
                 } else {
+                    println!("Processing in order");
                     let block_diff = self.extract_apply_block_diff(next_hash).await?;
                     block_ref.block_diff = Some(block_diff);
                     self.head_buffer.write().await.push(block_ref.clone());
