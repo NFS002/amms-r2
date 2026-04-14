@@ -41,12 +41,15 @@ pub mod debug_formatters {
         f.write_str("\n")
     }
 
-    pub fn fmt_prefix<T: std::fmt::Debug>(
-        f: &mut fmt::Formatter<'_>,
-        value: &T,
-        prefix: &str,
-    ) -> fmt::Result {
-        let s = format!("{:?}", value);
+    pub fn fmt_prefix<T>(f: &mut fmt::Formatter<'_>, value: &T, prefix: &str) -> fmt::Result
+    where
+        T: std::fmt::Display + std::fmt::Debug,
+    {
+        let s = if f.alternate() {
+            format!("{:#?}", value)
+        } else {
+            format!("{}", value)
+        };
         for line in s.lines() {
             writeln!(f, "{}{}", prefix, line)?;
         }

@@ -10,8 +10,7 @@ use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
-use crate::amms::formatters::debug_formatters::fmt_prefix;
-use crate::amms::formatters::debug_formatters::{dbg_block_ref, short_str};
+use crate::amms::formatters::debug_formatters::{dbg_block_ref, fmt_prefix, short_str};
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
@@ -51,16 +50,13 @@ use std::fmt;
 use std::fmt::Debug;
 use std::fs::read_to_string;
 use std::fs::File;
-use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::u128;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
-use tracing::debug;
-use tracing::info;
-use tracing::warn;
+use tracing::{debug, info};
 
 pub const CACHE_SIZE: usize = 30;
 
@@ -182,26 +178,30 @@ impl BlockBuffer {
         let len = self.blocks.len();
         writeln!(f, "BlockBuffer ({}/{})", len, self.capacity)?;
 
+        let blocks = self.blocks.iter().rev();
+
         match len {
             0..=4 => {
-                for block in &self.blocks {
+                for block in blocks {
                     fmt_prefix(f, block, "\t")?;
                 }
             }
             _ => {
-                for block in self.blocks.iter().take(2) {
+                let top2 = blocks.clone().take(2).clone();
+                let bottom2 = blocks.skip(len - 2);
+                for block in top2 {
                     fmt_prefix(f, block, "\t")?;
                 }
 
                 writeln!(f, "\t...")?;
 
-                for block in self.blocks.iter().skip(len - 2) {
+                for block in bottom2 {
                     fmt_prefix(f, block, "\t")?;
                 }
             }
         }
 
-        writeln!(f, "----End of BlockBuffer----")
+        write!(f, "")
     }
 }
 
@@ -230,6 +230,7 @@ pub struct StateSpaceManager<N, P> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMeta {
     filters: Vec<PoolFilter>,
+    factories: Vec<Factory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,25 +514,33 @@ impl<N, P> StateSpaceManager<N, P> {
             tokio::pin!(block_stream);
 
             while let Some(next_block) = block_stream.next().await {
-                println!(
-                "Next: block: {:?}, number: {}\n\n\n",
-                    next_block.hash(), next_block.number()
+                info!(
+                    target = "state_space::subscribe",
+                    number = next_block.number(),
+                    hash = short_str(next_block.hash()),
+                    "Processing next block"
                 );
-                println!("{:#?}", self.head_buffer.read().await);
                 let mut block_ref: BlockRef = next_block.into();
                 let BlockRef { hash: next_hash, parent_hash: next_parent_hash, .. } = block_ref;
                 let curr_hash = self.head_buffer.read().await.head().map(|b| b.hash).unwrap_or(next_parent_hash);
                 let next_head: BlockRef = if next_parent_hash != curr_hash {
-                  println!("Performing reorg");
-                  self.reorg(block_ref).await?
+                    info!(
+                        ?next_hash,
+                        ?next_parent_hash,
+                        target = "state_space::subscribe",
+                        "Reorg detected"
+                    );
+                    self.reorg(block_ref).await?
                 } else {
-                    println!("Processing in order");
                     let block_diff = self.extract_apply_block_diff(next_hash).await?;
                     block_ref.block_diff = Some(block_diff);
                     self.head_buffer.write().await.push(block_ref.clone());
                     block_ref
                 };
 
+
+                info!(target="state_space::subscribe", "{:#?}", self.head_buffer.read().await);
+                info!(target="state_space::subscribe", "{}", self.state.read().await);
                 yield Ok(next_head);
             }
         }))
@@ -784,7 +793,9 @@ where
         });
 
         StateSpaceBuilder {
-            amms: value.amms.clone(),
+            filters: value.meta.filters,
+            factories: value.meta.factories,
+            amms: value.amms,
             ..self
         }
     }
@@ -806,6 +817,7 @@ where
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
         let sync_start = Instant::now();
         let factories_count = self.factories.len();
+        let filters_count = self.filters.len();
         let chain_tip = BlockId::from(self.http_provider.get_block_number().await?);
         let factories = self.factories.clone();
         let mut futures = FuturesUnordered::new();
@@ -931,10 +943,10 @@ where
 
         if let Some(path) = self.output_file.as_deref() {
             debug!(
-                target: "state_space::sync",
+                target = "state_space::sync",
                 path = %path,
                 amms = %new_amms_count,
-                "Attempting to sync to output file"
+                "Syncing to output file"
             );
 
             let file = File::create_new(path)
@@ -949,6 +961,7 @@ where
                 amms,
                 meta: CacheMeta {
                     filters: self.filters.clone(),
+                    factories: self.factories.clone(),
                 },
             };
 
@@ -971,6 +984,7 @@ where
             target: "state_space::sync",
             elapsed_secs = sync_start.elapsed().as_secs_f32(),
             factories = factories_count,
+            filters = filters_count,
             amms = new_amms_count,
             "State space sync complete"
         );
@@ -1072,6 +1086,48 @@ impl StateSpace {
         }
 
         Ok(affected_amms.into_iter().collect())
+    }
+
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let l1 = if f.alternate() { 20 } else { 5 };
+        let l2 = self.state.len();
+
+        writeln!(f, "StateSpace ({}/{})", l1, l2)?;
+
+        let len = if f.alternate() { 20 } else { 5 };
+
+        for amm in self.state.values().take(len) {
+            match amm {
+                AMM::UniswapV2Pool(pool) => {
+                    writeln!(f, "UniswapV2Pool: {}", short_str(pool.address))?;
+                    writeln!(
+                        f,
+                        "\t0: {} -> {} ({})",
+                        short_str(pool.token_a.address),
+                        pool.reserve_0,
+                        pool.token_a.decimals
+                    )?;
+                    writeln!(
+                        f,
+                        "\t1: {} -> {} ({})",
+                        short_str(pool.token_b.address),
+                        pool.reserve_1,
+                        pool.token_b.decimals
+                    )?;
+                }
+                _ => {
+                    writeln!(f, "Unknown amm")?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for StateSpace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
     }
 }
 

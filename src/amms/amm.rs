@@ -11,7 +11,10 @@ use alloy::{
 };
 use eyre::Result;
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+};
 
 #[allow(async_fn_in_trait)]
 pub trait AutomatedMarketMaker {
@@ -132,6 +135,12 @@ macro_rules! amm {
             }
         }
 
+        impl fmt::Display for AMM {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "This is an AMM")
+            }
+        }
+
         impl Hash for AMM {
             fn hash<H: Hasher>(&self, state: &mut H) {
                 self.address().hash(state);
@@ -159,18 +168,23 @@ macro_rules! amm {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UniswapPool {
     V2(UniswapV2Pool),
-    V3(UniswapV3Pool)
+    V3(UniswapV3Pool),
 }
 
 impl UniswapPool {
-    pub fn address(&self) -> Address{
+    pub fn address(&self) -> Address {
         match self {
             UniswapPool::V2(pool) => pool.address(),
             UniswapPool::V3(pool) => pool.address(),
         }
     }
 
-    pub fn simulate_swap(&self, base_token: Address, quote_token: Address,amount_in: U256) -> Result<U256, AMMError> {
+    pub fn simulate_swap(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_in: U256,
+    ) -> Result<U256, AMMError> {
         match self {
             UniswapPool::V2(pool) => pool.simulate_swap(base_token, quote_token, amount_in),
             UniswapPool::V3(pool) => pool.simulate_swap(base_token, quote_token, amount_in),
