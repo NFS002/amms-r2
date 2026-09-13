@@ -4,6 +4,8 @@ use super::{
     balancer::BalancerFactory,
     error::AMMError,
 };
+use crate::state_space::filters::FilterStage;
+
 use alloy::{
     eips::BlockId,
     network::Network,
@@ -17,7 +19,6 @@ use std::{
     future::Future,
     hash::{Hash, Hasher},
 };
-
 pub trait DiscoverySync {
     fn discover<N, P>(
         &self,
@@ -44,6 +45,8 @@ pub trait AutomatedMarketMakerFactory: DiscoverySync {
 
     /// Address of the factory contract
     fn address(&self) -> Address;
+
+    fn stage(&self) -> FilterStage;
 
     /// Creates an unsynced pool from a creation log.
     fn create_pool(&self, log: Log) -> Result<AMM, AMMError>;
@@ -93,6 +96,12 @@ macro_rules! factory {
              pub fn creation_block(&self) -> u64 {
                 match self {
                     $(Factory::$factory_type(factory) => factory.creation_block(),)+
+                }
+            }
+
+            pub fn stage(&self) -> FilterStage {
+                match self {
+                    $(Factory::$factory_type(factory) => factory.stage(),)+
                 }
             }
 

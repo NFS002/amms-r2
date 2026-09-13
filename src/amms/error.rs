@@ -81,4 +81,7 @@ pub enum ReorgError {
 
     #[error("Missing block for {hash}")]
     MissingBlock { hash: BlockHash },
+
+    #[error("Reorg failed: {message}")]
+    ReorgFailed { message: &'static str },
 }

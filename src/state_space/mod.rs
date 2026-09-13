@@ -2,7 +2,8 @@ pub mod cache;
 pub mod discovery;
 pub mod error;
 pub mod filters;
-pub mod reorg;
+#[cfg(test)]
+mod tests;
 
 use crate::amms;
 use crate::amms::amm::AutomatedMarketMaker;
@@ -10,11 +11,13 @@ use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
-use crate::amms::formatters::debug_formatters::{dbg_block_ref, fmt_prefix, short_str};
+use crate::amms::formatters::debug_formatters::{dbg_block_ref, fmt_prefix};
+use crate::amms::retry_queue;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
 use crate::amms::uniswap_v3::IUniswapV3PoolEvents;
+use crate::state_space::filters::FilterStage;
 
 use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
@@ -34,7 +37,7 @@ use alloy::{
 use async_stream::stream;
 use cache::StateChange;
 use cache::StateChangeCache;
-use chrono::Local;
+use chrono::{Local, Utc};
 
 use error::StateSpaceError;
 use filters::AMMFilter;
@@ -46,10 +49,12 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::debug_assert;
 use std::fmt;
 use std::fmt::Debug;
 use std::fs::read_to_string;
 use std::fs::File;
+use std::ops::Not;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -86,8 +91,8 @@ pub struct PoolDiff {
 
 impl PoolDiff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let addr = short_str(&self.address);
-        writeln!(f, "PoolDiff for {}:", addr)?;
+        let addr = UniswapV2Pool::new_address_id(self.address);
+        writeln!(f, "diff-{}:", addr)?;
         fmt_prefix(f, &self.topic_name, "\t")?;
         let args = format_args!(
             "({}, {}) -> ({}, {})",
@@ -262,7 +267,7 @@ impl<N, P> StateSpaceManager<N, P> {
         // ---------------------------
         // Phase 0: Snapshot canonical state (short read lock)
         // ---------------------------
-        let (max_depth, canonical_hashes) = {
+        let (max_depth, hashes) = {
             let guard = self.head_buffer.read().await;
 
             let max_depth = guard.capacity as usize;
@@ -272,19 +277,20 @@ impl<N, P> StateSpaceManager<N, P> {
             (max_depth, hashes)
         };
 
-        let find_ancestor = |hash| canonical_hashes.iter().position(|&h| h == hash);
+        let find_ancestor = |hash| hashes.iter().position(|&h| h == hash);
 
         // ---------------------------
         // Phase 1: Walk backwards via RPC (no lock)
         // ---------------------------
         let mut cursor = new_head.shallow_clone();
         let mut depth = 0usize;
-        let mut new_branch_backwards: Vec<BlockRef> = Vec::new();
+        let mut new_branch: Vec<BlockRef> = Vec::new();
 
-        let (ancestor_idx_snapshot, ancestor_hash) = loop {
+        let (ancestor_idx, ancestor_hash) = loop {
             if let Some(idx) = find_ancestor(cursor.hash) {
                 info!(
-                    ?cursor.hash,
+                    hash = cursor.hash.to_string(),
+                    number = cursor.number,
                     ?depth,
                     ?idx,
                     target = "StateSpaceManager::reorg",
@@ -306,7 +312,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 .into());
             }
 
-            new_branch_backwards.push(BlockRef {
+            new_branch.push(BlockRef {
                 hash: cursor.hash,
                 parent_hash: cursor.parent_hash,
                 number: cursor.number,
@@ -348,10 +354,6 @@ impl<N, P> StateSpaceManager<N, P> {
             depth += 1;
         };
 
-        // Convert backward branch to forward order
-        let mut new_branch = new_branch_backwards;
-        new_branch.reverse();
-
         info!(
             new_branch_len = new_branch.len(),
             ?ancestor_hash,
@@ -359,10 +361,70 @@ impl<N, P> StateSpaceManager<N, P> {
             "Computed new branch"
         );
 
+        // Sanity check - makes sure the branches line up
+        {
+            let head_buffer = self.head_buffer.read().await;
+            let ancestor_block =
+                head_buffer
+                    .blocks
+                    .get(ancestor_idx)
+                    .ok_or(ReorgError::ReorgFailed {
+                        message: "ancestor block not found",
+                    })?;
+            let first_block_of_new_branch = new_branch.last().ok_or(ReorgError::ReorgFailed {
+                message: "new branch is empty",
+            })?;
+
+            if (ancestor_block.hash != first_block_of_new_branch.parent_hash) {
+                return Err(ReorgError::ReorgFailed { message: "ancestor block hash is not equal to the parent hash of the first block of the new branch" }.into());
+            } else if (ancestor_block.number != first_block_of_new_branch.number - 1) {
+                return Err(ReorgError::ReorgFailed { message: "ancestor block number is not equal to the block number - 1 of first block of the new branch" }.into());
+            }
+        };
+
         // ---------------------------
         // Phase 1b: Compute diffs (no lock)
         // ---------------------------
-        for b in &mut new_branch {
+        // for b in &mut new_branch {
+        //     let diff: AMMBlockDiff = match self.extract_apply_block_diff(b.hash).await {
+        //         Ok(d) => d,
+        //         Err(e) => {
+        //             tracing::error!(
+        //                 ?b.hash,
+        //                 target = "StateSpaceManager::reorg",
+        //                 "Failed to extract/apply block diff"
+        //             );
+        //             return Err(e);
+        //         }
+        //     };
+        //     b.block_diff = Some(diff);
+        // }
+
+        {
+            let mut guard = self.head_buffer.write().await;
+
+            let mut pruned_branch = guard.blocks.split_off(ancestor_idx + 1);
+            let pruned_len = pruned_branch.len();
+
+            info!(
+                pruned_len,
+                new_branch_len = new_branch.len(),
+                target = "StateSpaceManager::reorg",
+                "Applying reorg changes"
+            );
+
+            // Revert pruned branch
+            while let Some(b) = pruned_branch.pop_back() {
+                let diff = b.block_diff.expect("Pruned branch must have diff");
+                let ret = self.revert_block_diff(diff).await;
+                if let Some(err) = ret {
+                    return Err(err);
+                }
+            }
+        };
+
+        // Append new branch
+        for b in &mut new_branch.iter_mut().rev() {
             let diff: AMMBlockDiff = match self.extract_apply_block_diff(b.hash).await {
                 Ok(d) => d,
                 Err(e) => {
@@ -374,47 +436,20 @@ impl<N, P> StateSpaceManager<N, P> {
                     return Err(e);
                 }
             };
-            b.block_diff = Some(diff);
+            self.head_buffer.write().await.push(BlockRef {
+                block_diff: Some(diff),
+                ..b.shallow_clone()
+            });
         }
 
-        // ---------------------------
-        // Phase 2: Commit (short write lock)
-        // ---------------------------
-        let head = {
-            let mut guard = self.head_buffer.write().await;
-
-            let ancestor_idx_now = guard
-                .blocks
-                .iter()
-                .position(|b| b.hash == ancestor_hash)
-                .unwrap_or(ancestor_idx_snapshot);
-
-            let split_point = ancestor_idx_now + 1;
-
-            let mut pruned = guard.blocks.split_off(split_point);
-            let pruned_len = pruned.len();
-
-            info!(
-                pruned_len,
-                new_branch_len = new_branch.len(),
-                target = "StateSpaceManager::reorg",
-                "Applying reorg changes"
-            );
-
-            // Revert canonical blocks from tip backwards
-            while let Some(b) = pruned.pop_back() {
-                let diff = b.block_diff.expect("Canonical block must have diff");
-                self.revert_block_diff(diff);
-            }
-
-            // Append new branch
-            let head = new_branch.last().cloned();
-            for b in new_branch {
-                guard.blocks.push_back(b);
-            }
-
-            head.unwrap()
-        };
+        let head = self
+            .head_buffer
+            .read()
+            .await
+            .head()
+            .ok_or(ReorgError::ReorgFailed {
+                message: "Head buffer is empty after reorg",
+            })?;
 
         info!(?head, target = "StateSpaceManager::reorg", "Reorg complete");
         Ok(head)
@@ -434,6 +469,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     );
                     pool.reserve_0 = pool_diff.pre.r0;
                     pool.reserve_1 = pool_diff.pre.r1;
+                    pool.count = Some(pool.count.unwrap() - 1)
                 }
                 _ => unreachable!(),
             }
@@ -485,6 +521,7 @@ impl<N, P> StateSpaceManager<N, P> {
                             };
                             pool.reserve_0 = r0_post;
                             pool.reserve_1 = r1_post;
+                            pool.count = Some(pool.count.unwrap_or(0) + 1);
                             block_diff.push(pool_diff);
                         }
                         _ => unreachable!(),
@@ -517,13 +554,17 @@ impl<N, P> StateSpaceManager<N, P> {
                 info!(
                     target = "state_space::subscribe",
                     number = next_block.number(),
-                    hash = short_str(next_block.hash()),
+                    hash = next_block.hash().to_string(),
                     "Processing next block"
                 );
                 let mut block_ref: BlockRef = next_block.into();
                 let BlockRef { hash: next_hash, parent_hash: next_parent_hash, .. } = block_ref;
-                let curr_hash = self.head_buffer.read().await.head().map(|b| b.hash).unwrap_or(next_parent_hash);
-                let next_head: BlockRef = if next_parent_hash != curr_hash {
+                if self.head_buffer.read().await.blocks.iter().any(|b| b.hash == next_hash) {
+                    info!(target = "state_space::subscribe", "Duplicate notification: block already processed");
+                    continue;
+                }
+                let curr_hash = self.head_buffer.read().await.head().map(|h| h.hash);
+                let next_head: BlockRef = if curr_hash.is_some_and(|h| h != next_parent_hash) {
                     info!(
                         ?next_hash,
                         ?next_parent_hash,
@@ -539,8 +580,13 @@ impl<N, P> StateSpaceManager<N, P> {
                 };
 
 
-                info!(target="state_space::subscribe", "{:#?}", self.head_buffer.read().await);
-                info!(target="state_space::subscribe", "{}", self.state.read().await);
+                {
+                    let state = self.state.read().await;
+                    //let top_pools = state.get_counts();
+                    info!(target="state_space::subscribe", "{:#?}", self.head_buffer.read().await);
+                    info!(target="state_space::subscribe", "{}", state);
+                    //info!(target="state_space::subscribe", "Pool Count:\n{:#?}", top_pools);
+                }
                 yield Ok(next_head);
             }
         }))
@@ -785,6 +831,7 @@ where
 
         value.amms.iter_mut().for_each(|amm| {
             if let AMM::UniswapV2Pool(pool) = amm {
+                pool.set_ids();
                 pool.reserve_0 = 0;
                 pool.reserve_1 = 0;
             } else {
@@ -800,7 +847,11 @@ where
         }
     }
 
-    pub fn to_cache(self, output_file: String) -> StateSpaceBuilder<N, P> {
+    pub fn to_cache(self, output_file: Option<String>) -> StateSpaceBuilder<N, P> {
+        let output_file = output_file.unwrap_or_else(|| {
+            let date_time = Utc::now().to_rfc3339();
+            format!("data/{date_time}.json")
+        });
         StateSpaceBuilder {
             output_file: Some(output_file),
             ..self
@@ -820,8 +871,12 @@ where
         let filters_count = self.filters.len();
         let chain_tip = BlockId::from(self.http_provider.get_block_number().await?);
         let factories = self.factories.clone();
+        let discovery_factories = factories
+            .clone()
+            .into_iter()
+            .filter(|f| f.stage() == FilterStage::Discovery)
+            .collect_vec();
         let mut futures = FuturesUnordered::new();
-        //
         let mut filter_set = HashSet::new();
         for factory in &self.factories {
             for event in factory.pool_events() {
@@ -847,7 +902,7 @@ where
                 .push(amm);
         }
 
-        for factory in factories {
+        for factory in discovery_factories {
             let provider = self.http_provider.clone();
             let filters = self.filters.clone();
 
@@ -1009,6 +1064,27 @@ impl StateSpace {
         self.state.get_mut(address)
     }
 
+    pub fn get_counts(&self) -> Vec<String> {
+        let pools = self.state.values().clone().filter_map(|amm| match amm {
+            AMM::UniswapV2Pool(pool) => Some(pool.clone()),
+            _ => None,
+        });
+        let top_pools = pools
+            .sorted_by_key(|pool| pool.count.unwrap_or_default())
+            .rev()
+            .take(10)
+            .map(|pool| {
+                format!(
+                    "{}::{} ({})",
+                    pool.id(),
+                    pool.address,
+                    pool.count.unwrap_or_default()
+                )
+            })
+            .collect_vec();
+        top_pools
+    }
+
     pub fn sync(&mut self, logs: &[Log]) -> Result<Vec<Address>, StateSpaceError> {
         let latest = self.latest_block.load(Ordering::Relaxed);
         let Some(mut block_number) = logs
@@ -1089,28 +1165,26 @@ impl StateSpace {
     }
 
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let l1 = if f.alternate() { 20 } else { 5 };
+        let l1 = if f.alternate() { 20 } else { 10 };
         let l2 = self.state.len();
 
         writeln!(f, "StateSpace ({}/{})", l1, l2)?;
 
-        let len = if f.alternate() { 20 } else { 5 };
-
-        for amm in self.state.values().take(len) {
+        for amm in self.state.values().take(l1) {
             match amm {
                 AMM::UniswapV2Pool(pool) => {
-                    writeln!(f, "UniswapV2Pool: {}", short_str(pool.address))?;
+                    writeln!(f, "{}:", pool.id())?;
                     writeln!(
                         f,
                         "\t0: {} -> {} ({})",
-                        short_str(pool.token_a.address),
+                        pool.token_a.id(),
                         pool.reserve_0,
                         pool.token_a.decimals
                     )?;
                     writeln!(
                         f,
                         "\t1: {} -> {} ({})",
-                        short_str(pool.token_b.address),
+                        pool.token_b.id(),
                         pool.reserve_1,
                         pool.token_b.decimals
                     )?;

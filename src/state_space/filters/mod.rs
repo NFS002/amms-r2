@@ -4,9 +4,9 @@ pub mod whitelist;
 
 use async_trait::async_trait;
 use blacklist::BlacklistFilter;
+use serde::{Deserialize, Serialize};
 use value::ValueFilter;
 use whitelist::{PoolWhitelistFilter, TokenWhitelistFilter};
-use serde::{Serialize, Deserialize};
 
 use crate::amms::{amm::AMM, error::AMMError};
 #[async_trait]
@@ -15,8 +15,9 @@ pub trait AMMFilter {
     fn stage(&self) -> FilterStage;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Hash, Default, Copy, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum FilterStage {
+    #[default]
     Discovery,
     Sync,
 }

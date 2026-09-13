@@ -4,8 +4,9 @@ use super::{
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
     get_token_decimals, Token,
 };
-use crate::amms::{
-    consts::U256_1, uniswap_v3::GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
+use crate::{
+    amms::{consts::U256_1, uniswap_v3::GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo},
+    state_space::filters::FilterStage,
 };
 use alloy::{
     eips::BlockId,
@@ -745,6 +746,7 @@ impl UniswapV3Pool {
 pub struct UniswapV3Factory {
     pub address: Address,
     pub creation_block: u64,
+    pub stage: FilterStage,
 }
 
 impl UniswapV3Factory {
@@ -752,6 +754,7 @@ impl UniswapV3Factory {
         UniswapV3Factory {
             address,
             creation_block,
+            stage: FilterStage::Discovery,
         }
     }
 
@@ -1173,6 +1176,10 @@ impl AutomatedMarketMakerFactory for UniswapV3Factory {
 
     fn address(&self) -> Address {
         self.address
+    }
+
+    fn stage(&self) -> FilterStage {
+        self.stage
     }
 
     fn pool_creation_event(&self) -> B256 {

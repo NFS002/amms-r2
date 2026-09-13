@@ -1,3 +1,5 @@
+use crate::{amms::formatters::debug_formatters::base62_encode, state_space::filters::FilterStage};
+
 use super::{
     amm::{AutomatedMarketMaker, AMM},
     consts::{
@@ -13,11 +15,10 @@ use super::{
     Token,
 };
 
-
 use alloy::{
     eips::BlockId,
     network::Network,
-    primitives::{Address, Bytes, B256, U256},
+    primitives::{Address, Bytes, Keccak256, B256, U256},
     providers::Provider,
     rpc::types::Log,
     sol,
@@ -28,14 +29,18 @@ use rug::Float;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fmt::format,
     future::Future,
     hash::Hash,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use thiserror::Error;
 use tokio::time::Duration;
 use tracing::{info, warn};
 use IGetUniswapV2PoolDataBatchRequest::IGetUniswapV2PoolDataBatchRequestInstance;
 use IUniswapV2Factory::IUniswapV2FactoryInstance;
+
+static UNISWAP_V2_POOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 sol!(
 // UniswapV2Factory
@@ -83,12 +88,24 @@ pub enum UniswapV2Error {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UniswapV2Pool {
+    /// Unique instance number identifier, used for internal debugging.
+    /// Two instances for the same pool adddress would have different values.
+    #[serde(default)]
+    instance_id: usize,
+
+    /// A base64 encoding of the address, used for internal debugging
+    /// However, unlike Self.instance, the field is unique per token address, and not per instance
+    /// Not the canonical ERC20 symbol
+    #[serde(default)]
+    address_id: String,
+
     pub address: Address,
     pub token_a: Token,
     pub token_b: Token,
     pub reserve_0: u128,
     pub reserve_1: u128,
     pub fee: usize,
+    pub count: Option<isize>,
 }
 
 impl AutomatedMarketMaker for UniswapV2Pool {
@@ -217,12 +234,39 @@ pub fn u128_to_float(num: u128) -> Result<Float, AMMError> {
 }
 
 impl UniswapV2Pool {
+    fn new_instance_id() -> usize {
+        UNISWAP_V2_POOL_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn new_address_id(address: Address) -> String {
+        let mut hasher = Keccak256::new();
+        hasher.update(address);
+        let hash = hasher.finalize();
+
+        // Take first 8 bytes → u64
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash[..8]);
+        let num = u64::from_be_bytes(bytes);
+
+        base62_encode(num)
+    }
+
+    pub fn set_ids(&mut self) {
+        (self.instance_id == 0).then(|| self.instance_id = Self::new_instance_id());
+        (self.address_id.is_empty()).then(|| self.address_id = Self::new_address_id(self.address));
+    }
+
+    pub fn id(&self) -> String {
+        format!("uni2-{}", self.address_id)
+    }
+
     // Create a new, unsynced UniswapV2 pool
     // TODO: update the init function to derive the fee
     pub fn new(address: Address, fee: usize) -> Self {
         Self {
             address,
             fee,
+            instance_id: Self::new_instance_id(),
             ..Default::default()
         }
     }
@@ -377,6 +421,7 @@ pub struct UniswapV2Factory {
     pub fee: usize,
     pub creation_block: u64,
     pub pair_discovery_retry_attempts: usize,
+    pub stage: FilterStage,
 }
 
 impl UniswapV2Factory {
@@ -388,6 +433,7 @@ impl UniswapV2Factory {
             creation_block,
             fee,
             pair_discovery_retry_attempts: Self::DEFAULT_PAIR_DISCOVERY_RETRY_ATTEMPTS,
+            stage: FilterStage::Discovery,
         }
     }
 
@@ -415,9 +461,8 @@ impl UniswapV2Factory {
             .to::<usize>();
         let step = 766;
         info!(
-            target="amms::uniswap_v2::get_all_pairs",
-            pairs_length,
-            "Getting all pairs"
+            target = "amms::uniswap_v2::get_all_pairs",
+            pairs_length, "Getting all pairs"
         );
         let retry_delay = Duration::from_secs(10);
         let starts = (0..pairs_length).step_by(step).collect::<Vec<_>>();
@@ -570,19 +615,27 @@ impl AutomatedMarketMakerFactory for UniswapV2Factory {
         self.address
     }
 
+    fn stage(&self) -> FilterStage {
+        self.stage
+    }
+
     fn pool_creation_event(&self) -> B256 {
         IUniswapV2Factory::PairCreated::SIGNATURE_HASH
     }
 
     fn create_pool(&self, log: Log) -> Result<AMM, AMMError> {
         let event = IUniswapV2Factory::PairCreated::decode_log(&log.inner)?;
+        let address = event.pair;
         Ok(AMM::UniswapV2Pool(UniswapV2Pool {
-            address: event.pair,
+            address,
             token_a: event.token0.into(),
             token_b: event.token1.into(),
             reserve_0: 0,
             reserve_1: 0,
             fee: self.fee,
+            count: None,
+            instance_id: UniswapV2Pool::new_instance_id(),
+            address_id: UniswapV2Pool::new_address_id(address),
         }))
     }
 
@@ -627,6 +680,9 @@ impl DiscoverySync for UniswapV2Factory {
                         reserve_0: 0,
                         reserve_1: 0,
                         fee: self.fee,
+                        count: None,
+                        instance_id: UniswapV2Pool::new_instance_id(),
+                        address_id: UniswapV2Pool::new_address_id(pair),
                     })
                 })
                 .collect())
@@ -648,7 +704,12 @@ impl DiscoverySync for UniswapV2Factory {
             address = ?self.address,
             "Syncing all pools"
         );
-        UniswapV2Factory::sync_all_pools(amms, to_block, provider, self.pair_discovery_retry_attempts)
+        UniswapV2Factory::sync_all_pools(
+            amms,
+            to_block,
+            provider,
+            self.pair_discovery_retry_attempts,
+        )
     }
 }
 
@@ -681,8 +742,9 @@ mod tests {
     fn test_calculate_price_edge_case() {
         let token_a = address!("0d500b1d8e8ef31e21c99d1db9a6444d3adf1270");
         let token_b = address!("8f18dc399594b451eda8c5da02d0563c0b2d0f16");
+        let address = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
         let pool = UniswapV2Pool {
-            address: address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
+            address,
             token_a: Token::new_with_decimals(
                 address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
                 6,
@@ -694,6 +756,9 @@ mod tests {
             reserve_0: 23595096345912178729927,
             reserve_1: 154664232014390554564,
             fee: 300,
+            count: None,
+            instance_id: UniswapV2Pool::new_instance_id(),
+            address_id: UniswapV2Pool::new_address_id(address),
         };
 
         assert!(pool.calculate_price(token_a, Address::default()).unwrap() != 0.0);
@@ -702,8 +767,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_price() {
+        let address = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
         let pool = UniswapV2Pool {
-            address: address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
+            address,
             token_a: Token::new_with_decimals(
                 address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
                 6,
@@ -715,6 +781,9 @@ mod tests {
             reserve_0: 47092140895915,
             reserve_1: 28396598565590008529300,
             fee: 300,
+            count: None,
+            instance_id: UniswapV2Pool::new_instance_id(),
+            address_id: UniswapV2Pool::new_address_id(address),
         };
 
         let price_a_64_x = pool
@@ -732,8 +801,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_price_64_x_64() {
+        let address = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
         let pool = UniswapV2Pool {
-            address: address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
+            address,
             token_a: Token::new_with_decimals(
                 address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
                 6,
@@ -745,6 +815,9 @@ mod tests {
             reserve_0: 47092140895915,
             reserve_1: 28396598565590008529300,
             fee: 300,
+            count: None,
+            instance_id: UniswapV2Pool::new_instance_id(),
+            address_id: UniswapV2Pool::new_address_id(address),
         };
 
         let price_a_64_x = pool.calculate_price_64_x_64(pool.token_a.address).unwrap();

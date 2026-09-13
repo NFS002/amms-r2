@@ -1,14 +1,26 @@
+use core::sync;
 use std::{
     collections::HashMap,
+    fmt::format,
     hash::{Hash, Hasher},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use alloy::{dyn_abi::DynSolType, network::Network, primitives::Address, providers::Provider, sol};
+use alloy::{
+    dyn_abi::DynSolType,
+    network::Network,
+    primitives::{Address, FixedBytes, Keccak256},
+    providers::Provider,
+    sol,
+};
 use error::{AMMError, BatchContractError};
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::amms::{uniswap_v2::UniswapV2Pool, uniswap_v3::UniswapV3Pool};
+use crate::amms::{
+    formatters::debug_formatters::base62_encode, uniswap_v2::UniswapV2Pool,
+    uniswap_v3::UniswapV3Pool,
+};
 
 pub mod amm;
 pub mod balancer;
@@ -16,13 +28,15 @@ pub mod consts;
 pub mod erc_4626;
 pub mod error;
 pub mod factory;
-pub mod io;
 pub mod float;
+pub mod formatters;
+pub mod io;
+pub mod path;
 pub mod retry_queue;
 pub mod uniswap_v2;
-pub mod path;
 pub mod uniswap_v3;
-pub mod formatters;
+
+static ERC20_TOKEN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 sol! {
     #[sol(rpc)]
@@ -41,22 +55,64 @@ contract IERC20 {
 pub struct Token {
     pub address: Address,
     pub decimals: u8,
-    // TODO: add optional tax
+
+    /// Unique instance number identifier, used for internal debugging.
+    /// Two instances for the same token adddress would have different values.
+    #[serde(default)]
+    instance_id: usize,
+
+    /// A base64 encoding of the address, used for internal debugging
+    /// However, unlike Self.instance, the field is unique per token address, and not per instance
+    /// Not the canonical ERC20 symbol
+    #[serde(default)]
+    address_id: String,
 }
 
 impl Token {
+    fn new_instance_id() -> usize {
+        ERC20_TOKEN_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn new_address_id(address: Address) -> String {
+        let mut hasher = Keccak256::new();
+        hasher.update(address);
+        let hash = hasher.finalize();
+
+        // Take first 8 bytes → u64
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash[..8]);
+        let num = u64::from_be_bytes(bytes);
+
+        base62_encode(num)
+    }
+
+    pub fn id(&self) -> String {
+        format!("token-{}", self.address_id)
+    }
+
     pub async fn new<N, P>(address: Address, provider: P) -> Result<Self, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
-        let decimals = IERC20::new(address, provider).decimals().call().await?;
+        let contract = IERC20::new(address, provider);
+        let decimals = contract.decimals().call().await?;
 
-        Ok(Self { address, decimals })
+        Ok(Self {
+            address,
+            decimals,
+            instance_id: Self::new_instance_id(),
+            address_id: Self::new_address_id(address),
+        })
     }
 
-    pub const fn new_with_decimals(address: Address, decimals: u8) -> Self {
-        Self { address, decimals }
+    pub fn new_with_decimals(address: Address, decimals: u8) -> Self {
+        Self {
+            address,
+            decimals,
+            instance_id: Self::new_instance_id(),
+            address_id: Self::new_address_id(address),
+        }
     }
 
     pub const fn address(&self) -> &Address {
@@ -73,6 +129,8 @@ impl From<Address> for Token {
         Self {
             address,
             decimals: 0,
+            instance_id: Self::new_instance_id(),
+            address_id: Self::new_address_id(address),
         }
     }
 }

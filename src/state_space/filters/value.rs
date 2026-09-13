@@ -77,8 +77,6 @@ impl ValueFilter {
             return Ok(HashMap::new());
         }
 
-        let pool_len = pools.len();
-
         let provider =
             self.provider
                 .clone()

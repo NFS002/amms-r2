@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
 
+use crate::state_space::filters::FilterStage;
+
 use super::{
     amm::{AutomatedMarketMaker, AMM},
     consts::{BONE, MPFR_T_PRECISION},
@@ -365,6 +367,7 @@ impl BalancerPool {
 pub struct BalancerFactory {
     pub address: Address,
     pub creation_block: u64,
+    pub stage: FilterStage,
 }
 
 #[async_trait]
@@ -374,6 +377,10 @@ impl AutomatedMarketMakerFactory for BalancerFactory {
     /// Address of the factory contract
     fn address(&self) -> Address {
         self.address
+    }
+
+    fn stage(&self) -> FilterStage {
+        self.stage
     }
 
     /// Creates an unsynced pool from a creation log.
@@ -438,6 +445,7 @@ impl BalancerFactory {
         BalancerFactory {
             address,
             creation_block,
+            stage: FilterStage::Discovery,
         }
     }
 

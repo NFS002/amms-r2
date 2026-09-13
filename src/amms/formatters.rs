@@ -1,7 +1,23 @@
 pub mod debug_formatters {
     use std::fmt;
 
+    use alloy::primitives::{Address, Keccak256};
+
     use crate::state_space::{BlockBuffer, BlockRef};
+
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    pub fn base62_encode(mut num: u64) -> String {
+        let mut buf = Vec::new();
+
+        for _ in 0..6 {
+            buf.push(BASE62[(num % 62) as usize]);
+            num /= 62;
+        }
+
+        buf.reverse();
+        String::from_utf8(buf).unwrap()
+    }
 
     pub fn short_str<T: ToString>(b: T) -> String {
         let full_str = b.to_string();
@@ -10,28 +26,20 @@ pub mod debug_formatters {
         };
         let mut iter = full_str.chars();
 
-        let first: String = iter.by_ref().take(3).collect();
+        let first: String = iter.by_ref().skip(2).take(3).collect();
 
-        let last: String = full_str
-            .to_string()
-            .chars()
-            .rev()
-            .take(3)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let last: String = iter.by_ref().skip(full_str.len() - 3).take(3).collect();
 
-        format!("{}..{}", first, last)
+        format!("{}{}", first, last)
     }
 
     pub fn dbg_block_ref(block_ref: &BlockRef, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let h = short_str(block_ref.hash);
-        let ph = short_str(block_ref.parent_hash);
+        let h = block_ref.hash;
+        let ph = block_ref.parent_hash;
         writeln!(f, "BlockRef ({}): {} -> {}", block_ref.number, ph, h)?;
         let length = block_ref.block_diff.as_ref().map(|d| d.len()).unwrap_or(0);
-        writeln!(f, "Pools affected: {}", length)?;
         if f.alternate() {
+            writeln!(f, "Pools affected: {}", length)?;
             if let Some(diff) = &block_ref.block_diff {
                 for p in diff.iter().take(3) {
                     fmt_prefix(f, p, "\t")?;
