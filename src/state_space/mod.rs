@@ -578,8 +578,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     self.head_buffer.write().await.push(block_ref.clone());
                     block_ref
                 };
-
-
+                
                 {
                     let state = self.state.read().await;
                     //let top_pools = state.get_counts();
