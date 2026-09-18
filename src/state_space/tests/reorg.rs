@@ -45,6 +45,14 @@ fn manager(blocks: Vec<BlockRef>, capacity: u64, reserves: (u128, u128)) -> (Man
         let mut pool = UniswapV2Pool::new(address, 300);
         pool.reserve_0 = r0;
         pool.reserve_1 = r1;
+        pool.count = Some(
+            blocks
+                .iter()
+                .filter_map(|b| b.block_diff.as_ref())
+                .flatten()
+                .filter(|diff| diff.address == address)
+                .count() as isize,
+        );
         state.state.insert(address, AMM::UniswapV2Pool(pool));
     }
     (
@@ -116,7 +124,6 @@ async fn assert_chain(m: &Manager, expected: &[u8]) {
     }
 }
 
- 
 #[tokio::test]
 async fn empty_replacement_reverts_multiple_blocks_and_events_in_reverse_order() {
     // Reorg should roll back state to the {ancestor} block,
@@ -254,4 +261,69 @@ async fn too_deep_reorg_leaves_state_and_buffer_untouched() {
     assert_reserves(&m, (100, 200)).await;
     assert_chain(&m, &[10]).await;
     assert!(rpc.read_q().is_empty());
+}
+
+// Both RPC and decoding failures must preserve the complete pre-reorg state,
+// including diffs needed to retry the same reorg later.
+#[tokio::test]
+async fn failed_replacement_preserves_state_and_can_be_retried() {
+    for malformed_logs in [false, true] {
+        let ancestor = block(10, 10, 9, vec![]);
+        let old = block(11, 11, 10, vec![diff(POOL, (100, 200), (150, 150))]);
+        let new1 = block(11, 21, 10, vec![]);
+        let new2 = block(12, 22, 21, vec![]);
+        let (m, rpc) = manager(vec![ancestor.clone(), old], 3, (150, 150));
+        let before_buffer = serde_json::to_value(&*m.head_buffer.read().await).unwrap();
+        let before_state = serde_json::to_value(&m.state.read().await.state).unwrap();
+        parent_response(&rpc, &new1);
+        parent_response(&rpc, &ancestor);
+        logs_response(&rpc, &new1, &[(110, 190)]);
+        if malformed_logs {
+            // A valid event is followed by a malformed Sync in the second block.
+            logs_response(&rpc, &new2, &[(120, 180)]);
+            let mut response = rpc.write_q();
+            let last = response.pop_back().unwrap();
+            drop(response);
+            let alloy::transports::mock::MockResponse::Success(raw) = last else {
+                panic!("expected logs")
+            };
+            let mut logs: Vec<serde_json::Value> = serde_json::from_str(raw.get()).unwrap();
+            let mut invalid = logs[0].clone();
+            invalid["data"] = serde_json::json!("0x");
+            logs.push(invalid);
+            rpc.push_success(&logs);
+        } else {
+            rpc.push_failure_msg("second replacement block unavailable");
+        }
+        let error = m.reorg(new2.clone()).await.unwrap_err();
+        if malformed_logs {
+            assert!(matches!(error, StateSpaceError::AlloyError(_)));
+        } else {
+            assert!(matches!(error, StateSpaceError::TransportError(_)));
+        }
+        assert_eq!(
+            serde_json::to_value(&*m.head_buffer.read().await).unwrap(),
+            before_buffer
+        );
+        assert_eq!(
+            serde_json::to_value(&m.state.read().await.state).unwrap(),
+            before_state
+        );
+        assert!(rpc.read_q().is_empty());
+
+        parent_response(&rpc, &new1);
+        parent_response(&rpc, &ancestor);
+        logs_response(&rpc, &new1, &[(110, 190)]);
+        logs_response(&rpc, &new2, &[(120, 180)]);
+        let head = m.reorg(new2).await.unwrap();
+        assert_eq!(head.hash, B256::repeat_byte(22));
+        assert_reserves(&m, (120, 180)).await;
+        assert_chain(&m, &[10, 21, 22]).await;
+        let state = m.state.read().await;
+        let AMM::UniswapV2Pool(pool) = &state.state[&POOL] else {
+            panic!("expected pool")
+        };
+        assert_eq!(pool.count, Some(2));
+        assert!(rpc.read_q().is_empty());
+    }
 }

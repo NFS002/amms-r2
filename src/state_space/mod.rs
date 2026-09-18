@@ -382,74 +382,66 @@ impl<N, P> StateSpaceManager<N, P> {
             }
         };
 
-        // ---------------------------
-        // Phase 1b: Compute diffs (no lock)
-        // ---------------------------
-        // for b in &mut new_branch {
-        //     let diff: AMMBlockDiff = match self.extract_apply_block_diff(b.hash).await {
-        //         Ok(d) => d,
-        //         Err(e) => {
-        //             tracing::error!(
-        //                 ?b.hash,
-        //                 target = "StateSpaceManager::reorg",
-        //                 "Failed to extract/apply block diff"
-        //             );
-        //             return Err(e);
-        //         }
-        //     };
-        //     b.block_diff = Some(diff);
-        // }
-
-        {
-            let mut guard = self.head_buffer.write().await;
-
-            let mut pruned_branch = guard.blocks.split_off(ancestor_idx + 1);
-            let pruned_len = pruned_branch.len();
-
-            info!(
-                pruned_len,
-                new_branch_len = new_branch.len(),
-                target = "StateSpaceManager::reorg",
-                "Applying reorg changes"
-            );
-
-            // Revert pruned branch
-            while let Some(b) = pruned_branch.pop_back() {
-                let diff = b.block_diff.expect("Pruned branch must have diff");
-                let ret = self.revert_block_diff(diff).await;
-                if let Some(err) = ret {
-                    return Err(err);
-                }
-            }
-        };
-
-        // Append new branch
-        for b in &mut new_branch.iter_mut().rev() {
-            let diff: AMMBlockDiff = match self.extract_apply_block_diff(b.hash).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(
-                        ?b.hash,
-                        target = "StateSpaceManager::reorg",
-                        "Failed to extract/apply block diff"
-                    );
-                    return Err(e);
-                }
-            };
-            self.head_buffer.write().await.push(BlockRef {
-                block_diff: Some(diff),
-                ..b.shallow_clone()
-            });
+        // Fetch before changing live state. A failed RPC leaves the old branch intact.
+        let mut replacement_logs = Vec::with_capacity(new_branch.len());
+        for block in new_branch.iter().rev() {
+            let filter = self.block_filter.clone().at_block_hash(block.hash);
+            replacement_logs.push(self.provider.get_logs(&filter).await?);
         }
 
-        let head = self
-            .head_buffer
-            .read()
-            .await
-            .head()
-            .ok_or(ReorgError::ReorgFailed {
-                message: "Head buffer is empty after reorg",
+        // Stage rollback/replay privately, then publish both under the same locks.
+        // There are no awaits after acquiring both locks, including during commit.
+        let mut state_guard = self.state.write().await;
+        let mut buffer_guard = self.head_buffer.write().await;
+        if !buffer_guard
+            .blocks
+            .iter()
+            .map(|b| b.hash)
+            .eq(hashes.iter().copied())
+        {
+            return Err(ReorgError::ReorgFailed {
+                message: "Head buffer changed during reorg",
+            }
+            .into());
+        }
+        let mut staged_state = state_guard.state.clone();
+        let mut staged_buffer = buffer_guard.clone();
+        let pruned = staged_buffer.blocks.split_off(ancestor_idx + 1);
+        for block in pruned.iter().rev() {
+            let diff = block.block_diff.as_ref().ok_or(ReorgError::ReorgFailed {
+                message: "Pruned branch missing block diff",
             })?;
+            for change in diff.iter().rev() {
+                let Some(AMM::UniswapV2Pool(pool)) = staged_state.get_mut(&change.address) else {
+                    return Err(ReorgError::ReorgFailed {
+                        message: "Pruned diff references missing or unsupported pool",
+                    }
+                    .into());
+                };
+                pool.reserve_0 = change.pre.r0;
+                pool.reserve_1 = change.pre.r1;
+                pool.count = Some(
+                    pool.count
+                        .filter(|count| *count > 0)
+                        .ok_or(ReorgError::ReorgFailed {
+                            message: "Invalid pool count during rollback",
+                        })?
+                        - 1,
+                );
+            }
+        }
+        for (block, logs) in new_branch.iter().rev().zip(replacement_logs) {
+            let diff = Self::apply_logs(&mut staged_state, logs)?;
+            staged_buffer.push(BlockRef {
+                block_diff: Some(diff),
+                ..block.shallow_clone()
+            });
+        }
+        let head = staged_buffer.head().ok_or(ReorgError::ReorgFailed {
+            message: "Head buffer is empty after reorg",
+        })?;
+        state_guard.state = staged_state;
+        buffer_guard.blocks = staged_buffer.blocks;
 
         info!(?head, target = "StateSpaceManager::reorg", "Reorg complete");
         Ok(head)
@@ -491,10 +483,15 @@ impl<N, P> StateSpaceManager<N, P> {
             .get_logs(&block_filter)
             .await
             .map_err(|e| StateSpaceError::TransportError(e))?;
-        let mut block_diff = AMMBlockDiff::new();
         let mut state_guard = self.state.write().await;
-        let state = &mut state_guard.state;
+        Self::apply_logs(&mut state_guard.state, logs)
+    }
 
+    fn apply_logs(
+        state: &mut HashMap<Address, AMM>,
+        logs: Vec<Log>,
+    ) -> Result<AMMBlockDiff, StateSpaceError> {
+        let mut block_diff = AMMBlockDiff::new();
         for log in logs {
             let address = log.address();
             /* If we dont have this AMM, we can discard the log events */
@@ -578,7 +575,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     self.head_buffer.write().await.push(block_ref.clone());
                     block_ref
                 };
-                
+
                 {
                     let state = self.state.read().await;
                     //let top_pools = state.get_counts();
