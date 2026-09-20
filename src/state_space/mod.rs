@@ -1,3 +1,4 @@
+pub mod address;
 pub mod cache;
 pub mod discovery;
 pub mod error;
@@ -12,11 +13,14 @@ use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
 use crate::amms::formatters::debug_formatters::{dbg_block_ref, fmt_prefix};
+use crate::amms::path::find_arb_paths_v2;
+use crate::amms::path::UniswapArbPath;
 use crate::amms::retry_queue;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
 use crate::amms::uniswap_v3::IUniswapV3PoolEvents;
+use crate::state_space::address::WETH_ADDRESS;
 use crate::state_space::filters::FilterStage;
 
 use alloy::consensus::BlockHeader;
@@ -225,6 +229,7 @@ impl fmt::Display for BlockBuffer {
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
+    pub arb_paths_v2: Vec<UniswapArbPath>,
     pub block_filter: Filter,
     pub provider: P,
     pub pubsub_provider: P,
@@ -236,6 +241,7 @@ pub struct StateSpaceManager<N, P> {
 pub struct CacheMeta {
     filters: Vec<PoolFilter>,
     factories: Vec<Factory>,
+    arb_paths_v2: Vec<UniswapArbPath>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -771,6 +777,7 @@ pub struct StateSpaceBuilder<N, P> {
     pub latest_block: u64,
     pub factories: Vec<Factory>,
     pub amms: Vec<AMM>,
+    pub arb_paths_v2: Vec<UniswapArbPath>,
     pub filters: Vec<PoolFilter>,
     phantom: PhantomData<N>,
     output_file: Option<String>,
@@ -789,6 +796,7 @@ where
             factories: vec![],
             amms: vec![],
             filters: vec![],
+            arb_paths_v2: vec![],
             output_file: Option::None,
             // discovery: false,
             phantom: PhantomData,
@@ -838,6 +846,7 @@ where
         StateSpaceBuilder {
             filters: value.meta.filters,
             factories: value.meta.factories,
+            arb_paths_v2: value.meta.arb_paths_v2,
             amms: value.amms,
             ..self
         }
@@ -990,7 +999,21 @@ where
             // }
         }
 
-        let new_amms_count = state_space.state.values().cloned().count();
+        let new_amms_count = state_space.state.len();
+
+        let uniswapv2pools = state_space
+            .state
+            .values()
+            .filter_map(|value| {
+                if let AMM::UniswapV2Pool(pool) = value {
+                    Some(pool.clone())
+                } else {
+                    None
+                }
+            })
+            .collect_vec();
+
+        let arb_paths_v2 = find_arb_paths_v2(uniswapv2pools, WETH_ADDRESS);
 
         if let Some(path) = self.output_file.as_deref() {
             debug!(
@@ -1006,11 +1029,12 @@ where
                 })
                 .map_err(|e| AMMError::FileError(e))?;
 
-            let amms = state_space.state.values().cloned().collect::<Vec<AMM>>();
+            let all_amms = state_space.state.values().cloned().collect::<Vec<AMM>>();
 
             let file_contents = StateSpaceJSONFile {
-                amms,
+                amms: all_amms,
                 meta: CacheMeta {
+                    arb_paths_v2: arb_paths_v2.clone(),
                     filters: self.filters.clone(),
                     factories: self.factories.clone(),
                 },
@@ -1029,6 +1053,7 @@ where
                 blocks: VecDeque::with_capacity(64),
                 capacity: 64,
             })),
+            arb_paths_v2,
         };
 
         info!(

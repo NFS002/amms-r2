@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use alloy::primitives::{Address, U256};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use crate::amms::{amm::{AMM, AutomatedMarketMaker, UniswapPool}, error::AMMError, uniswap_v2::UniswapV2Pool};
 use itertools::Itertools;
 
@@ -15,7 +16,7 @@ pub struct SwapHop {
     pub quote: Address,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniswapHop {
     pub pool: UniswapPool,
     pub base: Address,
@@ -28,7 +29,7 @@ pub struct ArbPath {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniswapArbPath {
     pub hops: Vec<UniswapHop>,
 }

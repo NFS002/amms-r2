@@ -5,7 +5,6 @@ use alloy::{
     transports::layers::{RetryBackoffLayer, ThrottleLayer},
 };
 use amms::{amms::uniswap_v2::UniswapV2Factory, state_space::StateSpaceBuilder};
-use futures::StreamExt;
 use std::sync::Arc;
 
 #[tokio::main]

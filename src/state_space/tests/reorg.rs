@@ -41,6 +41,7 @@ fn manager(blocks: Vec<BlockRef>, capacity: u64, reserves: (u128, u128)) -> (Man
         .disable_recommended_fillers()
         .connect_mocked_client(rpc.clone());
     let mut state = StateSpace::default();
+    let mut pools: Vec<UniswapV2Pool> = Vec::new();
     for (address, (r0, r1)) in [(POOL, reserves), (OTHER, (900, 800))] {
         let mut pool = UniswapV2Pool::new(address, 300);
         pool.reserve_0 = r0;
@@ -53,8 +54,10 @@ fn manager(blocks: Vec<BlockRef>, capacity: u64, reserves: (u128, u128)) -> (Man
                 .filter(|diff| diff.address == address)
                 .count() as isize,
         );
+        pools.push(pool.clone());
         state.state.insert(address, AMM::UniswapV2Pool(pool));
     }
+    let arb_paths_v2 = find_arb_paths_v2(pools, WETH_ADDRESS);
     (
         StateSpaceManager {
             state: Arc::new(RwLock::new(state)),
@@ -66,6 +69,7 @@ fn manager(blocks: Vec<BlockRef>, capacity: u64, reserves: (u128, u128)) -> (Man
                 capacity,
             })),
             phantom: PhantomData,
+            arb_paths_v2
         },
         rpc,
     )
