@@ -69,7 +69,7 @@ fn manager(blocks: Vec<BlockRef>, capacity: u64, reserves: (u128, u128)) -> (Man
                 capacity,
             })),
             phantom: PhantomData,
-            arb_paths_v2
+            arb_paths: arb_paths_v2
         },
         rpc,
     )

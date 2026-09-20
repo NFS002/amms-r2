@@ -45,7 +45,7 @@ async-stream = "0.3.6"
 serde = "1.0"
 indicatif = "0.18.3"
 serde_json = "1.0"
-chrono = "0.4.43"
+chrono = { version = "0.4.43", features = ["serde"] }
 arc-swap = "1.8.2"
 alloy-consensus = "1.6.3"
 alloy-network = "1.6.3"

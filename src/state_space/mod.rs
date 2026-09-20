@@ -16,6 +16,7 @@ use crate::amms::formatters::debug_formatters::{dbg_block_ref, fmt_prefix};
 use crate::amms::path::find_arb_paths_v2;
 use crate::amms::path::UniswapArbPath;
 use crate::amms::retry_queue;
+use crate::amms::path::UniswapArbPaths;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
@@ -229,7 +230,7 @@ impl fmt::Display for BlockBuffer {
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
-    pub arb_paths_v2: Vec<UniswapArbPath>,
+    pub arb_paths: UniswapArbPaths,
     pub block_filter: Filter,
     pub provider: P,
     pub pubsub_provider: P,
@@ -241,7 +242,7 @@ pub struct StateSpaceManager<N, P> {
 pub struct CacheMeta {
     filters: Vec<PoolFilter>,
     factories: Vec<Factory>,
-    arb_paths_v2: Vec<UniswapArbPath>
+    arb_paths_v2: UniswapArbPaths
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,7 +778,7 @@ pub struct StateSpaceBuilder<N, P> {
     pub latest_block: u64,
     pub factories: Vec<Factory>,
     pub amms: Vec<AMM>,
-    pub arb_paths_v2: Vec<UniswapArbPath>,
+    pub arb_paths: UniswapArbPaths,
     pub filters: Vec<PoolFilter>,
     phantom: PhantomData<N>,
     output_file: Option<String>,
@@ -796,7 +797,7 @@ where
             factories: vec![],
             amms: vec![],
             filters: vec![],
-            arb_paths_v2: vec![],
+            arb_paths: UniswapArbPaths::default(),
             output_file: Option::None,
             // discovery: false,
             phantom: PhantomData,
@@ -846,7 +847,7 @@ where
         StateSpaceBuilder {
             filters: value.meta.filters,
             factories: value.meta.factories,
-            arb_paths_v2: value.meta.arb_paths_v2,
+            arb_paths: value.meta.arb_paths_v2,
             amms: value.amms,
             ..self
         }
@@ -1013,7 +1014,7 @@ where
             })
             .collect_vec();
 
-        let arb_paths_v2 = find_arb_paths_v2(uniswapv2pools, WETH_ADDRESS);
+        let arb_paths = find_arb_paths_v2(uniswapv2pools, WETH_ADDRESS);
 
         if let Some(path) = self.output_file.as_deref() {
             debug!(
@@ -1034,7 +1035,7 @@ where
             let file_contents = StateSpaceJSONFile {
                 amms: all_amms,
                 meta: CacheMeta {
-                    arb_paths_v2: arb_paths_v2.clone(),
+                    arb_paths_v2: arb_paths.clone(),
                     filters: self.filters.clone(),
                     factories: self.factories.clone(),
                 },
@@ -1053,7 +1054,7 @@ where
                 blocks: VecDeque::with_capacity(64),
                 capacity: 64,
             })),
-            arb_paths_v2,
+            arb_paths,
         };
 
         info!(
