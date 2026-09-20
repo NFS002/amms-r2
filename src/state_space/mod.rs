@@ -1,5 +1,5 @@
-pub mod address;
 pub mod cache;
+pub mod constants;
 pub mod discovery;
 pub mod error;
 pub mod filters;
@@ -15,13 +15,15 @@ use crate::amms::factory::Factory;
 use crate::amms::formatters::debug_formatters::{dbg_block_ref, fmt_prefix};
 use crate::amms::path::find_arb_paths_v2;
 use crate::amms::path::UniswapArbPath;
-use crate::amms::retry_queue;
 use crate::amms::path::UniswapArbPaths;
+use crate::amms::path::UniswapV2SimulationResult;
+use crate::amms::retry_queue;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
 use crate::amms::uniswap_v2::UniswapV2Pool;
 use crate::amms::uniswap_v3::IUniswapV3PoolEvents;
-use crate::state_space::address::WETH_ADDRESS;
+use crate::state_space::constants::address::WETH_ADDRESS;
+use crate::state_space::constants::WETH_AMOUNT_IN;
 use crate::state_space::filters::FilterStage;
 
 use alloy::consensus::BlockHeader;
@@ -30,6 +32,7 @@ use alloy::network::primitives::HeaderResponse;
 use alloy::primitives::BlockHash;
 use alloy::primitives::BlockNumber;
 use alloy::primitives::Uint;
+use alloy::primitives::U256;
 use alloy::rpc::types::FilterBlockOption;
 use alloy::rpc::types::Header;
 use alloy::rpc::types::{Block, Filter, FilterSet, Log};
@@ -59,6 +62,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::fs::read_to_string;
 use std::fs::File;
+use std::io::Error;
 use std::ops::Not;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
@@ -242,7 +246,7 @@ pub struct StateSpaceManager<N, P> {
 pub struct CacheMeta {
     filters: Vec<PoolFilter>,
     factories: Vec<Factory>,
-    arb_paths_v2: UniswapArbPaths
+    arb_paths_v2: UniswapArbPaths,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,6 +770,28 @@ impl<N, P> StateSpaceManager<N, P> {
             "State space resync from block complete"
         );
 
+        Ok(())
+    }
+
+    pub fn simulate_all_paths(&self) -> Result<(), Error> {
+        let amount_in = U256::from(WETH_AMOUNT_IN);
+        let paths = self.arb_paths.paths.clone();
+        for path_entry in paths {
+            let simulated_result = path_entry.path.simulate(amount_in);
+            match simulated_result {
+                Err(e) => {
+                    // Log error
+                }
+                Ok(res) => {
+                    let full_result = UniswapV2SimulationResult {
+                        amount_in,
+                        amount_out: res,
+                        // Get latest block
+                    };
+                    path_entry.last_simulation = Some(full_result);
+                }
+            }
+        }
         Ok(())
     }
 }

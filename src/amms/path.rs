@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, UniswapPool, AMM},
@@ -8,7 +8,6 @@ use crate::amms::{
 use alloy::primitives::{map::AddressMap, Address, BlockHash, U256};
 use chrono::{DateTime, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 type PathId = usize;
@@ -38,24 +37,24 @@ pub struct UniswapArbPath {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UniswapV2SimulationResult {
-    spread_pct: f64,
-    amount_in: U256,
-    amount_out: U256,
-    block_number: u64,
-    block_hash: BlockHash,
-    simulated_at: DateTime<Utc>
+pub struct UniswapV2SimulationResult {
+    pub spread_pct: f64,
+    pub amount_in: U256,
+    pub amount_out: U256,
+    pub block_number: u64,
+    pub block_hash: BlockHash,
+    pub simulated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UniswapArbPathEntry {
-    path: UniswapArbPath,
-    last_simulation: Option<UniswapV2SimulationResult>,
+pub struct UniswapArbPathEntry {
+    pub path: UniswapArbPath,
+    pub last_simulation: Option<UniswapV2SimulationResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UniswapArbPaths {
-    paths: Vec<UniswapArbPathEntry>,
+    pub paths: Vec<UniswapArbPathEntry>,
     paths_by_pool: AddressMap<Vec<PathId>>,
 }
 
@@ -83,13 +82,32 @@ impl UniswapArbPath {
     }
 }
 
+/// Enumerate directed, three-distinct-pool cycles starting at `token_in`.
+/// Index construction is linear; traversal visits connected two-hop candidates
+/// and looks up closing pools rather than scanning every pool a third time.
 pub fn find_arb_paths_v2(pools: Vec<UniswapV2Pool>, token_in: Address) -> UniswapArbPaths {
     let start_time = Instant::now();
+    let pair_key = |a: Address, b: Address| if a < b { (a, b) } else { (b, a) };
+    // Store both orientations, so direction is handled identically at every hop.
+    let mut pools_by_token: AddressMap<Vec<(Address, usize)>> = AddressMap::default();
+    let mut pools_by_pair: HashMap<(Address, Address), Vec<usize>> = HashMap::new();
+    let mut seen: AddressMap<()> = AddressMap::default();
+    for (id, pool) in pools.iter().enumerate() {
+        let (a, b) = (pool.token_a.address, pool.token_b.address);
+        if a == b || seen.insert(pool.address, ()).is_some() {
+            continue;
+        }
+        pools_by_token.entry(a).or_default().push((b, id));
+        pools_by_token.entry(b).or_default().push((a, id));
+        pools_by_pair.entry(pair_key(a, b)).or_default().push(id);
+    }
 
-    let token_out = token_in.clone();
-    let mut paths = Vec::new();
-
-    let pb = ProgressBar::new(pools.len() as u64);
+    let mut result = UniswapArbPaths::default();
+    let starts = pools_by_token
+        .get(&token_in)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let pb = ProgressBar::new(starts.len() as u64);
     pb.set_style(
         ProgressStyle::with_template(
             "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
@@ -97,123 +115,49 @@ pub fn find_arb_paths_v2(pools: Vec<UniswapV2Pool>, token_in: Address) -> Uniswa
         .unwrap()
         .progress_chars("##-"),
     );
-
-    for i in 0..pools.len() {
-        let pool_1 = &pools[i];
-        let tokens_1 = [pool_1.token_a.address, pool_1.token_b.address];
-        //let can_trade_1 = (pool_1.token_a.address == token_in) || (pool_1.token_b.address == token_in);
-        let can_trade_1 = tokens_1.contains(&token_in);
-
-        if can_trade_1 {
-            let zero_for_one_1 = tokens_1[0] == token_in;
-            let (token_in_1, token_out_1) = if zero_for_one_1 {
-                (pool_1.token_a.address, pool_1.token_b.address)
-            } else {
-                (pool_1.token_b.address, pool_1.token_a.address)
-            };
-            if token_in_1 != token_in {
+    for &(a, first) in starts {
+        for &(b, second) in &pools_by_token[&a] {
+            if b == token_in || first == second {
                 continue;
             }
-
-            for j in 0..pools.len() {
-                let pool_2 = &pools[j];
-                let tokens_2 = [pool_2.token_a.address, pool_2.token_b.address];
-                //let can_trade_2 = (pool_2.token_a.address == token_out_1) || (pool_2.token_b.address == token_out_1);
-                let can_trade_2 = tokens_2.contains(&token_out_1);
-
-                if can_trade_2 {
-                    let zero_for_one_2 = pool_2.token_a.address == token_out_1;
-                    let (token_in_2, token_out_2) = if zero_for_one_2 {
-                        (pool_2.token_a.address, pool_2.token_b.address)
-                    } else {
-                        (pool_2.token_b.address, pool_2.token_a.address)
-                    };
-                    if token_out_1 != token_in_2 {
-                        continue;
-                    }
-
-                    for k in 0..pools.len() {
-                        let pool_3 = &pools[k];
-                        let tokens_3 = [pool_3.token_a.address, pool_3.token_b.address];
-                        //let can_trade_3 = (pool_3.token_a.address == token_out_2) || (pool_3.token_b.address == token_out_2);
-
-                        let can_trade_3 =
-                            tokens_3.contains(&token_out_2) && pool_1.address != pool_3.address;
-
-                        if can_trade_3 {
-                            let zero_for_one_3 = (pool_3.token_a.address == token_out_2)
-                                || (pool_3.token_b.address == token_out_2);
-                            let (token_in_3, token_out_3) = if zero_for_one_3 {
-                                (pool_3.token_a.address, pool_3.token_b.address)
-                            } else {
-                                (pool_3.token_b.address, pool_3.token_a.address)
-                            };
-                            if token_out_2 != token_in_3 {
-                                continue;
-                            }
-
-                            if token_out_3 == token_out {
-                                let unique_pool_cnt =
-                                    vec![pool_1.address, pool_2.address, pool_3.address]
-                                        .into_iter()
-                                        .unique()
-                                        .collect::<Vec<Address>>()
-                                        .len();
-
-                                if unique_pool_cnt < 3 {
-                                    continue;
-                                }
-
-                                let hops = vec![
-                                    UniswapHop {
-                                        pool: UniswapPool::V2(pool_1.clone().into()),
-                                        base: token_in_1,
-                                        quote: token_out_1,
-                                    },
-                                    UniswapHop {
-                                        pool: UniswapPool::V2(pool_2.clone().into()),
-                                        base: token_in_2,
-                                        quote: token_out_2,
-                                    },
-                                    UniswapHop {
-                                        pool: UniswapPool::V2(pool_3.clone().into()),
-                                        base: token_in_3,
-                                        quote: token_out_3,
-                                    },
-                                ];
-
-                                let arb_path = UniswapArbPath { hops };
-
-                                paths.push(UniswapArbPathEntry {
-                                    path: arb_path,
-                                    last_simulation: None,
-                                }); 
-                            }
-                        }
-                    }
+            let Some(closing) = pools_by_pair.get(&pair_key(b, token_in)) else {
+                continue;
+            };
+            for &third in closing {
+                if third == first || third == second {
+                    continue;
                 }
+                let path_id = result.paths.len();
+                let hops = [(first, token_in, a), (second, a, b), (third, b, token_in)]
+                    .into_iter()
+                    .map(|(id, base, quote)| {
+                        result
+                            .paths_by_pool
+                            .entry(pools[id].address)
+                            .or_default()
+                            .push(path_id);
+                        UniswapHop {
+                            pool: UniswapPool::V2(pools[id].clone().into()),
+                            base,
+                            quote,
+                        }
+                    }).collect();
+                result.paths.push(UniswapArbPathEntry {
+                    path: UniswapArbPath { hops },
+                    last_simulation: None,
+                });
             }
         }
-
         pb.inc(1);
     }
-
     pb.finish_with_message(format!(
         "Generated {} 3-hop arbitrage paths in {} seconds",
-        paths.len(),
+        result.paths.len(),
         start_time.elapsed().as_secs()
     ));
-
-    // Build index
-
-    let mut paths_by_pool: AddressMap<Vec<PathId>> = AddressMap::default();
-    for (path_id, path_entry) in paths.iter().enumerate() {
-        for pool_address in path_entry.path.hops.iter().map(|h| h.pool.address()) {
-            paths_by_pool.entry(pool_address).or_default().push(path_id);
-        }
-    }
-
-    // Build index
-    
-    UniswapArbPaths { paths, paths_by_pool }
+    result
 }
+
+#[cfg(test)]
+#[path = "tests/path.rs"]
+mod tests;
