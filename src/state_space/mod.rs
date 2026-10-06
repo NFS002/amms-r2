@@ -13,6 +13,7 @@ use crate::amms::error::AMMError;
 use crate::amms::error::ReorgError;
 use crate::amms::factory::Factory;
 use crate::amms::formatters::debug_formatters::{dbg_block_ref, fmt_prefix};
+use crate::amms::math::percentage_change_bp;
 use crate::amms::path::find_arb_paths_v2;
 use crate::amms::path::UniswapArbPath;
 use crate::amms::path::UniswapArbPaths;
@@ -27,12 +28,12 @@ use crate::state_space::constants::WETH_AMOUNT_IN;
 use crate::state_space::filters::FilterStage;
 
 use alloy::consensus::BlockHeader;
-use alloy::eips::BlockId;
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::primitives::HeaderResponse;
 use alloy::primitives::BlockHash;
 use alloy::primitives::BlockNumber;
 use alloy::primitives::Uint;
-use alloy::primitives::U256;
+use alloy::primitives::{U256, I256};
 use alloy::rpc::types::FilterBlockOption;
 use alloy::rpc::types::Header;
 use alloy::rpc::types::{Block, Filter, FilterSet, Log};
@@ -42,9 +43,11 @@ use alloy::{
     primitives::{Address, FixedBytes},
     providers::Provider,
 };
+use alloy_network::BlockResponse;
 use async_stream::stream;
 use cache::StateChange;
 use cache::StateChangeCache;
+use chrono::DateTime;
 use chrono::{Local, Utc};
 
 use error::StateSpaceError;
@@ -70,6 +73,7 @@ use std::sync::atomic::Ordering;
 use std::u128;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
+use tracing::warn;
 use tracing::{debug, info};
 
 pub const CACHE_SIZE: usize = 30;
@@ -113,7 +117,7 @@ impl PoolDiff {
 
 impl fmt::Display for PoolDiff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.fmt(f)
+    self.fmt(f)
     }
 }
 
@@ -234,11 +238,12 @@ impl fmt::Display for BlockBuffer {
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
-    pub arb_paths: UniswapArbPaths,
+    pub arb_paths: Arc<RwLock<UniswapArbPaths>>,
+    pub head_buffer: Arc<RwLock<BlockBuffer>>,
+    pub synced_at: Option<BlockRef>,
     pub block_filter: Filter,
     pub provider: P,
     pub pubsub_provider: P,
-    pub head_buffer: Arc<RwLock<BlockBuffer>>,
     phantom: PhantomData<N>,
 }
 
@@ -261,6 +266,13 @@ pub struct StateSpaceJSONFile {
  *  - Updates self.state and applied pool diffs of new branch
  *  - Returns a result of <new_head, error> */
 impl<N, P> StateSpaceManager<N, P> {
+    pub async fn head(&self) -> Option<BlockRef> {
+        self.head_buffer
+            .read()
+            .await
+            .head()
+            .or(self.synced_at.clone())
+    }
     pub async fn reorg(&self, new_head: BlockRef) -> Result<BlockRef, StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
@@ -773,26 +785,42 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(())
     }
 
-    pub fn simulate_all_paths(&self) -> Result<(), Error> {
+    pub async fn simulate_all_paths(&self) -> Result<Vec<UniswapV2SimulationResult>, Error> {
         let amount_in = U256::from(WETH_AMOUNT_IN);
-        let paths = self.arb_paths.paths.clone();
-        for path_entry in paths {
+        let mut simulation_results: Vec<UniswapV2SimulationResult> = Vec::new();
+        let head = self
+            .head()
+            .await
+            .expect("Expected a head block at this point");
+        let mut arb_paths = self.arb_paths.write().await;
+        for (idx, path_entry) in arb_paths.paths.iter_mut().enumerate() {
             let simulated_result = path_entry.path.simulate(amount_in);
             match simulated_result {
                 Err(e) => {
-                    // Log error
+                    warn!(
+                        path_id = idx,
+                        error = e.to_string(),
+                        target = "state_space::StateSpaceManager::simulate_all_paths",
+                        "Error simulating path",
+                    );
                 }
                 Ok(res) => {
                     let full_result = UniswapV2SimulationResult {
+                        path_id: idx,
                         amount_in,
                         amount_out: res,
-                        // Get latest block
+                        pct_gain_bp: percentage_change_bp(amount_in, res),
+                        block_hash: head.hash,
+                        block_number: head.number,
+                        simulated_at: Local::now().to_utc(),
+                        spread_pct: res.into()
                     };
-                    path_entry.last_simulation = Some(full_result);
+                    path_entry.last_simulation = Some(full_result.clone());
+                    simulation_results.push(full_result);
                 }
             }
         }
-        Ok(())
+        Ok(simulation_results)
     }
 }
 
@@ -901,7 +929,18 @@ where
         let sync_start = Instant::now();
         let factories_count = self.factories.len();
         let filters_count = self.filters.len();
-        let chain_tip = BlockId::from(self.http_provider.get_block_number().await?);
+        let latest_block = self
+            .http_provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await?
+            .expect("Failed to fetch latest block");
+        let block_ref = BlockRef {
+            hash: latest_block.header().hash(),
+            parent_hash: latest_block.header().parent_hash(),
+            number: latest_block.header().number(),
+            block_diff: None,
+        };
+        let blockId = BlockId::from(latest_block.header().number());
         let factories = self.factories.clone();
         let discovery_factories = factories
             .clone()
@@ -940,7 +979,7 @@ where
 
             let extension = amm_variants.remove(&factory.variant());
             futures.push(tokio::spawn(async move {
-                let mut discovered_amms = factory.discover(chain_tip, provider.clone()).await?;
+                let mut discovered_amms = factory.discover(blockId, provider.clone()).await?;
 
                 if let Some(amms) = extension {
                     discovered_amms.extend(amms);
@@ -963,7 +1002,7 @@ where
                     }
                 }
 
-                discovered_amms = factory.sync(discovered_amms, chain_tip, provider).await?;
+                discovered_amms = factory.sync(discovered_amms, blockId, provider).await?;
 
                 // Apply sync filters
                 for filter in filters.iter() {
@@ -1002,7 +1041,7 @@ where
                     info!("Syncing {} UniswapV2 AMMs", remaining_amms.len());
                     let res = UniswapV2Factory::sync_all_pools(
                         remaining_amms,
-                        chain_tip,
+                        blockId,
                         self.http_provider.clone(),
                         5,
                     )
@@ -1018,12 +1057,6 @@ where
                     variant
                 ),
             };
-
-            // for mut amm in remaining_amms {
-            //     let address = amm.address();
-            //     amm = amm.init(chain_tip, self.provider.clone()).await?;
-            //     state_space.state.insert(address, amm);
-            // }
         }
 
         let new_amms_count = state_space.state.len();
@@ -1072,15 +1105,16 @@ where
 
         let ssm = StateSpaceManager {
             state: Arc::new(RwLock::new(state_space)),
-            block_filter,
-            provider: self.http_provider.clone(),
-            pubsub_provider: self.pubsub_provider.clone(),
-            phantom: PhantomData,
+            arb_paths: Arc::new(RwLock::new(arb_paths)),
             head_buffer: Arc::new(RwLock::new(BlockBuffer {
                 blocks: VecDeque::with_capacity(64),
                 capacity: 64,
             })),
-            arb_paths,
+            block_filter,
+            synced_at: Some(block_ref),
+            provider: self.http_provider.clone(),
+            pubsub_provider: self.pubsub_provider.clone(),
+            phantom: PhantomData
         };
 
         info!(

@@ -1,11 +1,11 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, fmt, time::Instant};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, UniswapPool, AMM},
     error::AMMError,
     uniswap_v2::UniswapV2Pool,
 };
-use alloy::primitives::{map::AddressMap, Address, BlockHash, U256};
+use alloy::primitives::{Address, B256, BlockHash, I256, U256, keccak256, map::AddressMap};
 use chrono::{DateTime, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -31,16 +31,55 @@ pub struct ArbPath {
     pub hops: Vec<SwapHop>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UniswapArbPath {
     pub hops: Vec<UniswapHop>,
 }
 
+impl UniswapArbPath {
+    pub fn id(&self) -> B256 {
+        let mut addresses: Vec<u8> = Vec::with_capacity(96);
+        self.hops.iter().for_each(|h| addresses.extend_from_slice(h.pool.address().as_slice()));
+        keccak256(addresses)
+    }
+
+    pub fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hops = self.hops.iter().enumerate();
+        let length = hops.len();
+        for (idx, UniswapHop { pool, ..}) in hops {
+            writeln!(f, "Hop {}/{}", idx + 1, length)?;
+            //writeln!(f, "\tPool: {}", pool)?;
+            // writeln!(f, "\tFee: {}", pool.fee())?;
+            // writeln!(f, "\t\tToken (a): {}", pool.token_a().address)?;
+            // writeln!(f, "\t\t\tToken (a) decimals: {}", pool.token_a().decimals())?;
+            // writeln!(f, "\t\t\tToken (a) reserves: {}", pool.r0())?;
+            // writeln!(f, "\t\tToken (b): {}", pool.token_b().address)?;
+            // writeln!(f, "\t\t\tToken (b) decimals: {}", pool.token_b().decimals())?;
+            // writeln!(f, "\t\t\tToken (b) reserves: {}", pool.r1())?;
+        }
+        writeln!(f, "")
+    }
+}
+
+impl fmt::Display for UniswapArbPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
+    }
+}
+
+impl fmt::Debug for UniswapArbPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniswapV2SimulationResult {
-    pub spread_pct: f64,
+    pub path_id: usize,
+    pub spread_pct: U256,
     pub amount_in: U256,
     pub amount_out: U256,
+    pub pct_gain_bp: I256,
     pub block_number: u64,
     pub block_hash: BlockHash,
     pub simulated_at: DateTime<Utc>,
@@ -55,7 +94,7 @@ pub struct UniswapArbPathEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UniswapArbPaths {
     pub paths: Vec<UniswapArbPathEntry>,
-    paths_by_pool: AddressMap<Vec<PathId>>,
+    pub paths_by_pool: AddressMap<Vec<PathId>>,
 }
 
 impl ArbPath {

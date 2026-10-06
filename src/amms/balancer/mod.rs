@@ -26,7 +26,7 @@ use super::{
     consts::{BONE, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    float::u256_to_float,
+    math::u256_to_float,
     Token,
 };
 
