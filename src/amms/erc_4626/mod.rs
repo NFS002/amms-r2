@@ -2,7 +2,7 @@ use super::{
     amm::AutomatedMarketMaker,
     consts::{U128_0X10000000000000000, U256_10000, U256_2},
     error::AMMError,
-    float::q64_to_float,
+    math::q64_to_float,
     uniswap_v2::div_uu,
 };
 use alloy::{

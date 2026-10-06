@@ -28,7 +28,7 @@ pub mod consts;
 pub mod erc_4626;
 pub mod error;
 pub mod factory;
-pub mod float;
+pub mod math;
 pub mod formatters;
 pub mod io;
 pub mod path;

@@ -10,7 +10,7 @@ use super::{
     },
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    float::q64_to_float,
+    math::q64_to_float,
     retry_queue::{run_retry_queue, RetryQueueOutcome},
     Token,
 };

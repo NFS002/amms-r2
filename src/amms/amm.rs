@@ -1,3 +1,5 @@
+use crate::amms::Token;
+
 use super::{
     balancer::BalancerPool, erc_4626::ERC4626Vault, error::AMMError, uniswap_v2::UniswapV2Pool,
     uniswap_v3::UniswapV3Pool,
@@ -176,6 +178,41 @@ impl UniswapPool {
         match self {
             UniswapPool::V2(pool) => pool.address(),
             UniswapPool::V3(pool) => pool.address(),
+        }
+    }
+
+    pub fn token_a(&self) -> Token {
+        match self {
+            UniswapPool::V2(pool) => pool.token_a.clone(),
+            UniswapPool::V3(pool) => pool.token_a.clone() // NOT IMPLEMENTED
+        }
+    }
+
+    pub fn token_b(&self) -> Token {
+        match self {
+            UniswapPool::V2(pool) => pool.token_b.clone(),
+            UniswapPool::V3(pool) => pool.token_b.clone() // NOT IMPLEMENTED
+        }
+    }
+
+    pub fn r0(&self) -> u128 {
+        match self {
+            UniswapPool::V2(pool) => pool.reserve_0,
+            UniswapPool::V3(_) => 0 // NOT IMPLEMENTED
+        }
+    }
+
+    pub fn r1(&self) -> u128 {
+        match self {
+            UniswapPool::V2(pool) => pool.reserve_1,
+            UniswapPool::V3(_) => 0 // NOT IMPLEMENTED
+        }
+    }
+
+    pub fn fee(&self) -> usize {
+        match self {
+            UniswapPool::V2(pool) => pool.fee,
+            UniswapPool::V3(_) => 0 // NOT IMPLEMENTED
         }
     }
 

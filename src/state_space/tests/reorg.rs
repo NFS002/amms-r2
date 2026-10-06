@@ -60,6 +60,7 @@ fn manager(blocks: Vec<BlockRef>, capacity: u64, reserves: (u128, u128)) -> (Man
     let arb_paths_v2 = find_arb_paths_v2(pools, WETH_ADDRESS);
     (
         StateSpaceManager {
+            synced_at: None,
             state: Arc::new(RwLock::new(state)),
             block_filter: Filter::new().event_signature(IUniswapV2Pair::Sync::SIGNATURE_HASH),
             provider: provider.clone(),
@@ -69,7 +70,7 @@ fn manager(blocks: Vec<BlockRef>, capacity: u64, reserves: (u128, u128)) -> (Man
                 capacity,
             })),
             phantom: PhantomData,
-            arb_paths: arb_paths_v2
+            arb_paths: Arc::new(RwLock::new(arb_paths_v2))
         },
         rpc,
     )
