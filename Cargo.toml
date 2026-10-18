@@ -36,13 +36,12 @@ futures = "0.3"
 async-trait = "0.1"
 
 # misc
-arraydeque = "0.5"
 thiserror = "1.0"
 rug = "1.24.1"
 itertools = "0.14.0"
 rayon = "1.11.0"
 async-stream = "0.3.6"
-serde = "1.0"
+serde = { version = "1.0", features = ["rc"] }
 indicatif = "0.18.3"
 serde_json = "1.0"
 chrono = { version = "0.4.43", features = ["serde"] }

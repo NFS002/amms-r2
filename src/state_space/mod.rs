@@ -1,4 +1,3 @@
-pub mod cache;
 pub mod constants;
 pub mod discovery;
 pub mod error;
@@ -17,7 +16,9 @@ use crate::amms::math::percentage_change_bp;
 use crate::amms::path::find_arb_paths_v2;
 use crate::amms::path::UniswapArbPath;
 use crate::amms::path::UniswapArbPaths;
-use crate::amms::path::UniswapV2SimulationResult;
+use crate::amms::path::{
+    CachedSimulation, SimulationBatch, SimulationContext, UniswapSimulationResult,
+};
 use crate::amms::retry_queue;
 use crate::amms::uniswap_v2::IUniswapV2Pair;
 use crate::amms::uniswap_v2::UniswapV2Factory;
@@ -33,7 +34,7 @@ use alloy::network::primitives::HeaderResponse;
 use alloy::primitives::BlockHash;
 use alloy::primitives::BlockNumber;
 use alloy::primitives::Uint;
-use alloy::primitives::{U256, I256};
+use alloy::primitives::{I256, U256};
 use alloy::rpc::types::FilterBlockOption;
 use alloy::rpc::types::Header;
 use alloy::rpc::types::{Block, Filter, FilterSet, Log};
@@ -45,8 +46,6 @@ use alloy::{
 };
 use alloy_network::BlockResponse;
 use async_stream::stream;
-use cache::StateChange;
-use cache::StateChangeCache;
 use chrono::DateTime;
 use chrono::{Local, Utc};
 
@@ -68,15 +67,11 @@ use std::fs::File;
 use std::io::Error;
 use std::ops::Not;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::u128;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 use tracing::{debug, info};
-
-pub const CACHE_SIZE: usize = 30;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PoolReserves {
@@ -117,7 +112,7 @@ impl PoolDiff {
 
 impl fmt::Display for PoolDiff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    self.fmt(f)
+        self.fmt(f)
     }
 }
 
@@ -134,6 +129,10 @@ pub struct BlockRef {
     pub hash: BlockHash,
     pub parent_hash: BlockHash,
     pub number: BlockNumber,
+    pub timestamp: u64,
+    pub base_fee_per_gas: Option<u64>,
+    pub gas_used: u64,
+    pub gas_limit: u64,
     pub block_diff: Option<AMMBlockDiff>,
 }
 
@@ -143,6 +142,10 @@ impl From<Header> for BlockRef {
             hash: header.hash,
             parent_hash: header.inner.parent_hash,
             number: header.number,
+            timestamp: header.timestamp(),
+            base_fee_per_gas: header.base_fee_per_gas(),
+            gas_used: header.gas_used(),
+            gas_limit: header.gas_limit(),
             block_diff: None,
         }
     }
@@ -167,6 +170,10 @@ impl BlockRef {
             hash: self.hash,
             parent_hash: self.parent_hash,
             number: self.number,
+            timestamp: self.timestamp,
+            base_fee_per_gas: self.base_fee_per_gas,
+            gas_used: self.gas_used,
+            gas_limit: self.gas_limit,
             block_diff: None,
         }
     }
@@ -178,6 +185,15 @@ pub struct BlockBuffer {
     pub capacity: u64,
 }
 
+impl Default for BlockBuffer {
+    fn default() -> Self {
+        Self {
+            blocks: VecDeque::with_capacity(64),
+            capacity: 64,
+        }
+    }
+}
+
 impl BlockBuffer {
     pub fn push(&mut self, block: BlockRef) {
         self.blocks.push_back(block);
@@ -187,7 +203,11 @@ impl BlockBuffer {
         }
     }
 
-    pub fn head(&self) -> Option<BlockRef> {
+    pub fn head(&self) -> Option<&BlockRef> {
+        self.blocks.iter().last()
+    }
+
+    pub fn clone_head(&self) -> Option<BlockRef> {
         let b = self.blocks.iter().last();
         b.cloned()
     }
@@ -238,9 +258,6 @@ impl fmt::Display for BlockBuffer {
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
-    pub arb_paths: Arc<RwLock<UniswapArbPaths>>,
-    pub head_buffer: Arc<RwLock<BlockBuffer>>,
-    pub synced_at: Option<BlockRef>,
     pub block_filter: Filter,
     pub provider: P,
     pub pubsub_provider: P,
@@ -260,18 +277,14 @@ pub struct StateSpaceJSONFile {
     meta: CacheMeta,
 }
 
-/* Reorg from: closest_ancestor(new_head, self.head_buffer.block_heads[0]) to new_head
- *  - Updates self.head_buffer.block_heads with head_refs of new branch
+/* Reorg from the closest buffered ancestor to new_head.
+ *  - Updates the state's head buffer with the new branch
  *  - Updates self.state and removes pool diffs from pruned branch
  *  - Updates self.state and applied pool diffs of new branch
  *  - Returns a result of <new_head, error> */
 impl<N, P> StateSpaceManager<N, P> {
     pub async fn head(&self) -> Option<BlockRef> {
-        self.head_buffer
-            .read()
-            .await
-            .head()
-            .or(self.synced_at.clone())
+        self.state.read().await.clone_head()
     }
     pub async fn reorg(&self, new_head: BlockRef) -> Result<BlockRef, StateSpaceError>
     where
@@ -291,7 +304,8 @@ impl<N, P> StateSpaceManager<N, P> {
         // Phase 0: Snapshot canonical state (short read lock)
         // ---------------------------
         let (max_depth, hashes) = {
-            let guard = self.head_buffer.read().await;
+            let state = self.state.read().await;
+            let guard = &state.head_buffer;
 
             let max_depth = guard.capacity as usize;
 
@@ -335,12 +349,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 .into());
             }
 
-            new_branch.push(BlockRef {
-                hash: cursor.hash,
-                parent_hash: cursor.parent_hash,
-                number: cursor.number,
-                block_diff: None,
-            });
+            new_branch.push(cursor.shallow_clone());
 
             let parent_hash = cursor.parent_hash;
 
@@ -386,7 +395,8 @@ impl<N, P> StateSpaceManager<N, P> {
 
         // Sanity check - makes sure the branches line up
         {
-            let head_buffer = self.head_buffer.read().await;
+            let state = self.state.read().await;
+            let head_buffer = &state.head_buffer;
             let ancestor_block =
                 head_buffer
                     .blocks
@@ -412,11 +422,11 @@ impl<N, P> StateSpaceManager<N, P> {
             replacement_logs.push(self.provider.get_logs(&filter).await?);
         }
 
-        // Stage rollback/replay privately, then publish both under the same locks.
-        // There are no awaits after acquiring both locks, including during commit.
+        // Stage rollback/replay privately, then publish pools and head together.
+        // There are no awaits after acquiring the write guard.
         let mut state_guard = self.state.write().await;
-        let mut buffer_guard = self.head_buffer.write().await;
-        if !buffer_guard
+        if !state_guard
+            .head_buffer
             .blocks
             .iter()
             .map(|b| b.hash)
@@ -427,9 +437,10 @@ impl<N, P> StateSpaceManager<N, P> {
             }
             .into());
         }
-        let mut staged_state = state_guard.state.clone();
-        let mut staged_buffer = buffer_guard.clone();
+        let mut staged_state = state_guard.pools.clone();
+        let mut staged_buffer = state_guard.head_buffer.clone();
         let pruned = staged_buffer.blocks.split_off(ancestor_idx + 1);
+        info!(target = "state_space::sync", from = ?state_guard.clone_head().map(|head| head.number), to = ?staged_buffer.clone_head().map(|head| head.number), "Unwinding state changes");
         for block in pruned.iter().rev() {
             let diff = block.block_diff.as_ref().ok_or(ReorgError::ReorgFailed {
                 message: "Pruned branch missing block diff",
@@ -451,20 +462,23 @@ impl<N, P> StateSpaceManager<N, P> {
                         })?
                         - 1,
                 );
+                debug!(target = "state_space::sync", amm = ?pool, "Reverting AMM state (staged)");
             }
         }
         for (block, logs) in new_branch.iter().rev().zip(replacement_logs) {
-            let diff = Self::apply_logs(&mut staged_state, logs)?;
+            let diff = StateSpace::apply_logs(&mut staged_state, logs)?;
+            debug!(target = "state_space::sync", block_hash = ?block.hash, state_change = ?diff, "Caching state change (staged)");
             staged_buffer.push(BlockRef {
                 block_diff: Some(diff),
                 ..block.shallow_clone()
             });
         }
-        let head = staged_buffer.head().ok_or(ReorgError::ReorgFailed {
+        let head = staged_buffer.clone_head().ok_or(ReorgError::ReorgFailed {
             message: "Head buffer is empty after reorg",
         })?;
-        state_guard.state = staged_state;
-        buffer_guard.blocks = staged_buffer.blocks;
+        state_guard.pools = staged_state;
+        state_guard.head_buffer = staged_buffer;
+        state_guard.invalidate_simulations();
 
         info!(?head, target = "StateSpaceManager::reorg", "Reorg complete");
         Ok(head)
@@ -472,7 +486,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
     pub async fn revert_block_diff(&self, diff: AMMBlockDiff) -> Option<StateSpaceError> {
         let mut state_guard = self.state.write().await;
-        let state = &mut state_guard.state;
+        let state = &mut state_guard.pools;
         for pool_diff in diff.iter().rev() {
             match state.get_mut(&pool_diff.address) {
                 Some(AMM::UniswapV2Pool(pool)) => {
@@ -484,11 +498,13 @@ impl<N, P> StateSpaceManager<N, P> {
                     );
                     pool.reserve_0 = pool_diff.pre.r0;
                     pool.reserve_1 = pool_diff.pre.r1;
-                    pool.count = Some(pool.count.unwrap() - 1)
+                    pool.count = Some(pool.count.unwrap() - 1);
+                    debug!(target = "state_space::sync", amm = ?pool, "Reverting AMM state");
                 }
                 _ => unreachable!(),
             }
         }
+        state_guard.invalidate_simulations();
         Option::None
     }
 
@@ -507,56 +523,15 @@ impl<N, P> StateSpaceManager<N, P> {
             .await
             .map_err(|e| StateSpaceError::TransportError(e))?;
         let mut state_guard = self.state.write().await;
-        Self::apply_logs(&mut state_guard.state, logs)
-    }
-
-    fn apply_logs(
-        state: &mut HashMap<Address, AMM>,
-        logs: Vec<Log>,
-    ) -> Result<AMMBlockDiff, StateSpaceError> {
-        let mut block_diff = AMMBlockDiff::new();
-        for log in logs {
-            let address = log.address();
-            /* If we dont have this AMM, we can discard the log events */
-            if let Some(amm) = state.get_mut(&address) {
-                match log.topic0() {
-                    Some(topic0 @ &IUniswapV2Pair::Sync::SIGNATURE_HASH) => match amm {
-                        AMM::UniswapV2Pool(pool) => {
-                            let decoded_log = IUniswapV2Pair::Sync::decode_log(&log.inner)
-                                .map_err(|e| StateSpaceError::AlloyError(e))?;
-                            let r0_post = decoded_log.reserve0.to::<u128>();
-                            let r1_post = decoded_log.reserve1.to::<u128>();
-                            let pool_diff = PoolDiff {
-                                topic_name: IUniswapV2Pair::Sync::SIGNATURE.to_string(),
-                                topic: *topic0,
-                                address,
-                                pre: PoolReserves {
-                                    r0: pool.reserve_0,
-                                    r1: pool.reserve_1,
-                                },
-                                post: PoolReserves {
-                                    r0: r0_post,
-                                    r1: r1_post,
-                                },
-                            };
-                            pool.reserve_0 = r0_post;
-                            pool.reserve_1 = r1_post;
-                            pool.count = Some(pool.count.unwrap_or(0) + 1);
-                            block_diff.push(pool_diff);
-                        }
-                        _ => unreachable!(),
-                    },
-                    _ => unreachable!(),
-                }
-            }
-        }
-        Ok(block_diff)
+        let diff = state_guard.apply_pool_logs(logs)?;
+        state_guard.invalidate_simulations();
+        Ok(diff)
     }
 
     pub fn subscribe(
         self: Arc<Self>,
     ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<BlockRef, StateSpaceError>> + Send>>,
+        Pin<Box<dyn Stream<Item = Result<SimulationBatch, StateSpaceError>> + Send>>,
         StateSpaceError,
     >
     where
@@ -577,141 +552,90 @@ impl<N, P> StateSpaceManager<N, P> {
                     hash = next_block.hash().to_string(),
                     "Processing next block"
                 );
-                let mut block_ref: BlockRef = next_block.into();
-                let BlockRef { hash: next_hash, parent_hash: next_parent_hash, .. } = block_ref;
-                if self.head_buffer.read().await.blocks.iter().any(|b| b.hash == next_hash) {
-                    info!(target = "state_space::subscribe", "Duplicate notification: block already processed");
-                    continue;
+                if let Some(batch) = self.process_next_block(next_block.into()).await? {
+                    yield Ok(batch);
                 }
-                let curr_hash = self.head_buffer.read().await.head().map(|h| h.hash);
-                let next_head: BlockRef = if curr_hash.is_some_and(|h| h != next_parent_hash) {
-                    info!(
-                        ?next_hash,
-                        ?next_parent_hash,
-                        target = "state_space::subscribe",
-                        "Reorg detected"
-                    );
-                    self.reorg(block_ref).await?
-                } else {
-                    let block_diff = self.extract_apply_block_diff(next_hash).await?;
-                    block_ref.block_diff = Some(block_diff);
-                    self.head_buffer.write().await.push(block_ref.clone());
-                    block_ref
-                };
-
-                {
-                    let state = self.state.read().await;
-                    //let top_pools = state.get_counts();
-                    info!(target="state_space::subscribe", "{:#?}", self.head_buffer.read().await);
-                    info!(target="state_space::subscribe", "{}", state);
-                    //info!(target="state_space::subscribe", "Pool Count:\n{:#?}", top_pools);
-                }
-                yield Ok(next_head);
             }
         }))
     }
 
-    pub async fn subscribe_new_blocks(
+    // Keep block processing independently testable without a websocket connection.
+    async fn process_next_block(
         &self,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send>>,
-        StateSpaceError,
-    >
+        block_ref: BlockRef,
+    ) -> Result<Option<SimulationBatch>, StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
         N: Network<BlockResponse = Block>,
     {
-        let provider = self.pubsub_provider.clone();
-        let state = self.state.clone();
-        let mut block_filter = self.block_filter.clone();
-
-        let block_stream = provider.subscribe_blocks().await?.into_stream();
-
-        Ok(Box::pin(stream! {
-            tokio::pin!(block_stream);
-
-            while let Some(block) = block_stream.next().await {
-                let now = Local::now().to_string();
-                let block_number = block.number();
-                block_filter = block_filter.select(block_number);
-
-
-                let logs = provider.get_logs(&block_filter).await?;
-
-                let affected_amms = state.write().await.sync(&logs)?;
-
-                yield Ok(affected_amms);
+        let next_hash = block_ref.hash;
+        let (duplicate, curr_hash) = {
+            let state = self.state.read().await;
+            let head_hash = state
+                .clone_head()
+                .map(|head| head.hash)
+                .expect("Expected head hash");
+            (
+                head_hash == next_hash
+                    || state.head_buffer.blocks.iter().any(|b| b.hash == next_hash),
+                head_hash,
+            )
+        };
+        if duplicate {
+            info!(
+                target = "state_space::subscribe",
+                "Duplicate notification: block already processed"
+            );
+            return Ok(None);
+        }
+        if curr_hash != block_ref.parent_hash {
+            info!(target = "state_space::subscribe", ?next_hash, next_parent_hash = ?block_ref.parent_hash, "Reorg detected");
+            let head = self.reorg(block_ref).await?;
+            let state = self.state.write().await;
+            if state.clone_head().map(|current| current.hash) != Some(head.hash) {
+                return Err(Error::new(
+                    std::io::ErrorKind::Other,
+                    "State changed before reorg simulation",
+                )
+                .into());
             }
-        }))
+            // Rollbacks and backfilled blocks can affect paths absent from the final block diff.
+            //state.simulate_all_paths(U256::from(WETH_AMOUNT_IN))?
+        } else {
+            let filter = self.block_filter.clone().at_block_hash(next_hash);
+            let logs = self.provider.get_logs(&filter).await?;
+            let mut state = self.state.write().await;
+            state.apply_block(block_ref, logs)?;
+            //state.simulate_affected_paths(U256::from(WETH_AMOUNT_IN))?
+        };
+
+        let batch = {
+            let mut state = self.state.write().await;
+            let amount_in = U256::from(WETH_AMOUNT_IN);
+            if state.head_buffer.blocks.len() == 1 {
+                state.simulate_all_paths(amount_in)?
+            } else {
+                state.simulate_affected_paths(amount_in)?
+            }
+        };
+        {
+            let state = self.state.read().await;
+            info!(
+                target = "state_space::subscribe",
+                "{:#?}", state.head_buffer
+            );
+            info!(target = "state_space::subscribe", "{}", state);
+        }
+        // The write guard has dropped before the batch reaches the stream consumer.
+        Ok(Some(batch))
     }
 
-    pub async fn resync(&mut self) -> Result<(), AMMError>
+    pub async fn resync(&self) -> Result<(), AMMError>
     where
         N: Network,
         P: Provider<N> + Clone + 'static,
     {
-        let sync_start = Instant::now();
-        let chain_tip = BlockId::from(self.provider.get_block_number().await?);
-
-        let old_map = {
-            let state = self.state.read().await;
-            state.state.clone()
-        };
-
-        let n_prev_amms = old_map.values().len();
-
-        let mut amm_variants = HashMap::new();
-        for (_, amm) in old_map {
-            amm_variants
-                .entry(amm.variant())
-                .or_insert_with(Vec::new)
-                .push(amm);
-        }
-
-        let mut new_state = HashMap::new();
-
-        for (variant, remaining_amms) in amm_variants.drain() {
-            match variant {
-                amms::amm::Variant::UniswapV2Pool => {
-                    info!("Syncing {} UniswapV2 AMMs", remaining_amms.len());
-                    let res = UniswapV2Factory::sync_all_pools(
-                        remaining_amms,
-                        chain_tip,
-                        self.provider.clone(),
-                        5,
-                    )
-                    .await?;
-                    for amm in res {
-                        new_state.insert(amm.address(), amm);
-                    }
-                }
-                // TODO other variantss
-                _ => info!(
-                    "Skipping syncing {} AMMs of variant {:?}",
-                    remaining_amms.len(),
-                    variant
-                ),
-            };
-        }
-
-        let n_curr_amms = new_state.values().len();
-
-        {
-            let mut state = self.state.write().await;
-            state.state = new_state;
-        }
-
-        info!(
-            target = "state_space:resync",
-            elapsed_secs = sync_start.elapsed().as_secs_f32(),
-            elapsed = sync_start.elapsed().as_secs_f32(),
-            ?n_prev_amms,
-            ?n_curr_amms,
-            chain_tip = chain_tip.as_u64(),
-            "State space resync complete"
-        );
-
-        Ok(())
+        self.resync_from_block(BlockId::latest()).await
     }
 
     pub async fn resync_from_block(&self, block: BlockId) -> Result<(), AMMError>
@@ -719,17 +643,32 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network,
         P: Provider<N> + Clone + 'static,
     {
-        let chain_tip = BlockId::from(self.provider.get_block_number().await?);
-
         let sync_start = Instant::now();
-
-        let old_map = {
+        let (old_map, expected_head) = {
             let state = self.state.read().await;
-            state.state.clone()
+            (
+                state.pools.clone(),
+                state.clone_head().map(|head| head.hash),
+            )
         };
-
-        let n_prev_amms = old_map.values().len();
-
+        let target =
+            self.provider.get_block(block).await?.ok_or_else(|| {
+                Error::new(std::io::ErrorKind::NotFound, "Resync block not found")
+            })?;
+        let header = target.header();
+        let head = BlockRef {
+            hash: header.hash(),
+            parent_hash: header.parent_hash(),
+            number: header.number(),
+            timestamp: header.timestamp(),
+            base_fee_per_gas: header.base_fee_per_gas(),
+            gas_used: header.gas_used(),
+            gas_limit: header.gas_limit(),
+            block_diff: None,
+        };
+        // Pin every pool read to the same block, even if the chain advances.
+        let block_id = BlockId::hash_canonical(head.hash);
+        let n_prev_amms = old_map.len();
         let mut amm_variants = HashMap::new();
         for (_, amm) in old_map {
             amm_variants
@@ -737,90 +676,62 @@ impl<N, P> StateSpaceManager<N, P> {
                 .or_insert_with(Vec::new)
                 .push(amm);
         }
-
-        let mut new_state = HashMap::new();
-
-        for (variant, remaining_amms) in amm_variants.drain() {
+        let mut new_pools = HashMap::new();
+        for (variant, remaining_amms) in amm_variants {
             match variant {
                 amms::amm::Variant::UniswapV2Pool => {
-                    info!("Syncing {} UniswapV2 AMMs", remaining_amms.len());
-                    let res = UniswapV2Factory::sync_all_pools(
+                    let pools = UniswapV2Factory::sync_all_pools(
                         remaining_amms,
-                        block,
+                        block_id,
                         self.provider.clone(),
                         5,
                     )
                     .await?;
-                    for amm in res {
-                        new_state.insert(amm.address(), amm);
+                    for pool in pools {
+                        new_pools.insert(pool.address(), pool);
                     }
                 }
-                // TODO other variantss
                 _ => info!(
                     "Skipping syncing {} AMMs of variant {:?}",
                     remaining_amms.len(),
                     variant
                 ),
-            };
+            }
         }
-
-        let n_curr_amms = new_state.values().len();
-
+        let n_curr_amms = new_pools.len();
         {
             let mut state = self.state.write().await;
-            state.state = new_state;
+            if state.clone_head().map(|head| head.hash) != expected_head {
+                return Err(Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "State advanced during resync; retry against the new head",
+                )
+                .into());
+            }
+            state.pools = new_pools;
+            state.head_buffer.blocks.clear();
+            state.head_buffer.push(head.clone());
+            state.synced_at = Some(head.clone());
+            state.invalidate_simulations();
         }
-
-        info!(
-            target = "state_space:resync_from_block",
-            elapsed_secs = sync_start.elapsed().as_secs_f32(),
-            elapsed = sync_start.elapsed().as_secs_f32(),
-            ?n_prev_amms,
-            ?n_curr_amms,
-            chain_tip = chain_tip.as_u64(),
-            block = block.as_u64(),
-            "State space resync from block complete"
-        );
-
+        info!(target = "state_space:resync", elapsed_secs = sync_start.elapsed().as_secs_f32(),
+            n_prev_amms, n_curr_amms, block_number = head.number, block_hash = ?head.hash,
+            "State space resync complete");
         Ok(())
     }
 
-    pub async fn simulate_all_paths(&self) -> Result<Vec<UniswapV2SimulationResult>, Error> {
-        let amount_in = U256::from(WETH_AMOUNT_IN);
-        let mut simulation_results: Vec<UniswapV2SimulationResult> = Vec::new();
-        let head = self
-            .head()
+    pub async fn simulate_all_paths(&self) -> Result<SimulationBatch, Error> {
+        self.state
+            .write()
             .await
-            .expect("Expected a head block at this point");
-        let mut arb_paths = self.arb_paths.write().await;
-        for (idx, path_entry) in arb_paths.paths.iter_mut().enumerate() {
-            let simulated_result = path_entry.path.simulate(amount_in);
-            match simulated_result {
-                Err(e) => {
-                    warn!(
-                        path_id = idx,
-                        error = e.to_string(),
-                        target = "state_space::StateSpaceManager::simulate_all_paths",
-                        "Error simulating path",
-                    );
-                }
-                Ok(res) => {
-                    let full_result = UniswapV2SimulationResult {
-                        path_id: idx,
-                        amount_in,
-                        amount_out: res,
-                        pct_gain_bp: percentage_change_bp(amount_in, res),
-                        block_hash: head.hash,
-                        block_number: head.number,
-                        simulated_at: Local::now().to_utc(),
-                        spread_pct: res.into()
-                    };
-                    path_entry.last_simulation = Some(full_result.clone());
-                    simulation_results.push(full_result);
-                }
-            }
-        }
-        Ok(simulation_results)
+            .simulate_all_paths(U256::from(WETH_AMOUNT_IN))
+    }
+
+    pub async fn simulate_affected_paths(&self) -> Result<SimulationBatch, Error> {
+        self.state
+            .write()
+            .await
+            .simulate_affected_paths(U256::from(WETH_AMOUNT_IN))
     }
 }
 
@@ -910,7 +821,7 @@ where
     pub fn to_cache(self, output_file: Option<String>) -> StateSpaceBuilder<N, P> {
         let output_file = output_file.unwrap_or_else(|| {
             let date_time = Utc::now().to_rfc3339();
-            format!("data/{date_time}.json")
+            format!("cache/pools/{date_time}.json")
         });
         StateSpaceBuilder {
             output_file: Some(output_file),
@@ -938,9 +849,13 @@ where
             hash: latest_block.header().hash(),
             parent_hash: latest_block.header().parent_hash(),
             number: latest_block.header().number(),
+            timestamp: latest_block.header().timestamp(),
+            base_fee_per_gas: latest_block.header().base_fee_per_gas(),
+            gas_used: latest_block.header().gas_used(),
+            gas_limit: latest_block.header().gas_limit(),
             block_diff: None,
         };
-        let blockId = BlockId::from(latest_block.header().number());
+        let block_id = BlockId::from(latest_block.header().number());
         let factories = self.factories.clone();
         let discovery_factories = factories
             .clone()
@@ -979,7 +894,7 @@ where
 
             let extension = amm_variants.remove(&factory.variant());
             futures.push(tokio::spawn(async move {
-                let mut discovered_amms = factory.discover(blockId, provider.clone()).await?;
+                let mut discovered_amms = factory.discover(block_id, provider.clone()).await?;
 
                 if let Some(amms) = extension {
                     discovered_amms.extend(amms);
@@ -1002,7 +917,7 @@ where
                     }
                 }
 
-                discovered_amms = factory.sync(discovered_amms, blockId, provider).await?;
+                discovered_amms = factory.sync(discovered_amms, block_id, provider).await?;
 
                 // Apply sync filters
                 for filter in filters.iter() {
@@ -1026,11 +941,12 @@ where
         }
 
         let mut state_space = StateSpace::default();
+        state_space.chain_id = Some(self.http_provider.get_chain_id().await?);
         while let Some(res) = futures.next().await {
             let synced_amms = res??;
 
             for amm in synced_amms {
-                state_space.state.insert(amm.address(), amm);
+                state_space.pools.insert(amm.address(), amm);
             }
         }
 
@@ -1041,13 +957,13 @@ where
                     info!("Syncing {} UniswapV2 AMMs", remaining_amms.len());
                     let res = UniswapV2Factory::sync_all_pools(
                         remaining_amms,
-                        blockId,
+                        block_id,
                         self.http_provider.clone(),
                         5,
                     )
                     .await?;
                     for amm in res {
-                        state_space.state.insert(amm.address(), amm);
+                        state_space.pools.insert(amm.address(), amm);
                     }
                 }
                 // TODO other variantss
@@ -1059,10 +975,10 @@ where
             };
         }
 
-        let new_amms_count = state_space.state.len();
+        let new_amms_count = state_space.pools.len();
 
         let uniswapv2pools = state_space
-            .state
+            .pools
             .values()
             .filter_map(|value| {
                 if let AMM::UniswapV2Pool(pool) = value {
@@ -1089,7 +1005,7 @@ where
                 })
                 .map_err(|e| AMMError::FileError(e))?;
 
-            let all_amms = state_space.state.values().cloned().collect::<Vec<AMM>>();
+            let all_amms = state_space.pools.values().cloned().collect::<Vec<AMM>>();
 
             let file_contents = StateSpaceJSONFile {
                 amms: all_amms,
@@ -1103,18 +1019,15 @@ where
             serde_json::to_writer(file, &file_contents).map_err(|e| AMMError::JSONError(e))?;
         }
 
+        state_space.arb_paths = arb_paths;
+        state_space.head_buffer.push(block_ref.clone());
+        state_space.synced_at = Some(block_ref);
         let ssm = StateSpaceManager {
             state: Arc::new(RwLock::new(state_space)),
-            arb_paths: Arc::new(RwLock::new(arb_paths)),
-            head_buffer: Arc::new(RwLock::new(BlockBuffer {
-                blocks: VecDeque::with_capacity(64),
-                capacity: 64,
-            })),
             block_filter,
-            synced_at: Some(block_ref),
             provider: self.http_provider.clone(),
             pubsub_provider: self.pubsub_provider.clone(),
-            phantom: PhantomData
+            phantom: PhantomData,
         };
 
         info!(
@@ -1132,22 +1045,249 @@ where
 
 #[derive(Debug, Default)]
 pub struct StateSpace {
-    pub state: HashMap<Address, AMM>,
-    pub latest_block: Arc<AtomicU64>,
-    cache: StateChangeCache<CACHE_SIZE>,
+    pub chain_id: Option<u64>,
+    pub pools: HashMap<Address, AMM>,
+    pub arb_paths: UniswapArbPaths,
+    pub head_buffer: BlockBuffer,
+    pub synced_at: Option<BlockRef>,
 }
 
 impl StateSpace {
+    /// The head represented by this state's pool reserves.
+    pub fn clone_head(&self) -> Option<BlockRef> {
+        self.head_buffer.clone_head()
+    }
+
+    fn invalidate_simulations(&mut self) {
+        for entry in &mut self.arb_paths.paths {
+            entry.last_simulation = None;
+        }
+    }
+
+    /// Commit a complete block under the caller's single state write guard.
+    pub(crate) fn apply_block(
+        &mut self,
+        mut block: BlockRef,
+        logs: Vec<Log>,
+    ) -> Result<BlockRef, StateSpaceError> {
+        if let Some(head) = self.clone_head() {
+            if block.parent_hash != head.hash || head.number.checked_add(1) != Some(block.number) {
+                return Err(ReorgError::ReorgFailed {
+                    message: "Block does not extend the current head",
+                }
+                .into());
+            }
+        }
+        Self::validate_block_logs(&block, &logs)?;
+        block.block_diff = Some(self.apply_pool_logs(logs)?);
+        debug!(target = "state_space::sync", block_hash = ?block.hash, state_change = ?block.block_diff, "Caching state change");
+        self.head_buffer.push(block.clone());
+        self.invalidate_simulations();
+        Ok(block)
+    }
+
+    fn validate_block_logs(block: &BlockRef, logs: &[Log]) -> Result<(), StateSpaceError> {
+        if logs.iter().any(|log| {
+            log.block_hash.is_some_and(|hash| hash != block.hash)
+                || log
+                    .block_number
+                    .is_some_and(|number| number != block.number)
+        }) {
+            return Err(ReorgError::ReorgFailed {
+                message: "Logs do not belong to the requested block",
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Stage only touched pools so a decoding error leaves live reserves intact.
+    fn apply_pool_logs(&mut self, logs: Vec<Log>) -> Result<AMMBlockDiff, StateSpaceError> {
+        let mut staged_pools: HashMap<_, _> = logs
+            .iter()
+            .filter_map(|log| {
+                self.pools
+                    .get(&log.address())
+                    .map(|pool| (log.address(), pool.clone()))
+            })
+            .collect();
+        let diff = Self::apply_logs(&mut staged_pools, logs)?;
+        self.pools.extend(staged_pools);
+        Ok(diff)
+    }
+
+    /// Simulate against one guarded state and return results with their shared head context.
+    pub fn simulate_all_paths(&mut self, amount_in: U256) -> Result<SimulationBatch, Error> {
+        info!(
+            target = "amms::state_space::StateSpace::simulate_all_paths",
+            amount_in = amount_in.to_string()
+        );
+        self.simulate_path_indices(amount_in, (0..self.arb_paths.paths.len()).collect())
+    }
+
+    fn simulate_path_indices(
+        &mut self,
+        amount_in: U256,
+        path_indices: Vec<usize>,
+    ) -> Result<SimulationBatch, Error> {
+        debug!(
+            target = "amms::state_space::StateSpace::simulate_path_indices",
+            amount_in = amount_in.to_string(),
+            n_paths = path_indices.len(),
+            path_indices = path_indices.iter().join(",")
+        );
+        let mut simulation_results = Vec::new();
+        let mut successful_indices = Vec::new();
+        let head = self
+            .clone_head()
+            .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "No synced head available"))?;
+        let chain_id = self
+            .chain_id
+            .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "No chain ID available"))?;
+        let pools = &self.pools;
+        for path_index in path_indices {
+            let path_entry = &mut self.arb_paths.paths[path_index];
+            let simulated_result = path_entry.path.resolve_pools(pools).and_then(|path| {
+                let amount_out = path.simulate(amount_in)?;
+                Ok((amount_out, path.snapshot()))
+            });
+            match simulated_result {
+                Err(e) => {
+                    path_entry.last_simulation = None;
+                    warn!(
+                        path_index = path_index,
+                        error = e.to_string(),
+                        target = "state_space::StateSpaceManager::simulate_all_paths",
+                        "Error simulating path",
+                    );
+                }
+                Ok((amount_out, path_snapshot)) => {
+                    let pct_change = percentage_change_bp(amount_in, amount_out);
+                    let full_result = UniswapSimulationResult {
+                        path_snapshot,
+                        amount_in,
+                        amount_out,
+                        pct_gain_bp: pct_change,
+                    };
+                    successful_indices.push(path_index);
+                    simulation_results.push(full_result);
+                    // debug!(
+                    //     target = "amms::state_space::StateSpace::simulate_path_indices",
+                    //     ?path_index,
+                    //     ?pct_change,
+                    //     ?amount_out,
+                    //     "Sucessfully simulated path"
+                    // );
+                }
+            }
+        }
+        let context = Arc::new(SimulationContext {
+            chain_id,
+            block_number: head.number,
+            block_hash: head.hash,
+            parent_hash: head.parent_hash,
+            block_timestamp: head.timestamp,
+            base_fee_per_gas: head.base_fee_per_gas,
+            gas_used: head.gas_used,
+            gas_limit: head.gas_limit,
+            simulated_at: Local::now().to_utc(),
+        });
+        // Attach the same completion timestamp and head context to every cached result.
+        for (index, result) in successful_indices.into_iter().zip(&simulation_results) {
+            self.arb_paths.paths[index].last_simulation = Some(CachedSimulation {
+                context: Arc::clone(&context),
+                result: result.clone(),
+            });
+        }
+        info!(
+            target = "amms::state_space::StateSpace::simulate_path_indices",
+            n_simulation_results = simulation_results.len(),
+            "Finished simulating paths"
+        );
+        Ok(SimulationBatch {
+            context,
+            results: simulation_results,
+        })
+    }
+
+    /// Simulate against one guarded state and return results with their shared head context.
+    pub fn simulate_affected_paths(&mut self, amount_in: U256) -> Result<SimulationBatch, Error> {
+        info!(
+            target = "amms::state_space::StateSpace::simulate_affected_paths",
+            amount_in = amount_in.to_string()
+        );
+        let head = self
+            .head_buffer
+            .head()
+            .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "No head available"))?;
+        let affected_pools = head
+            .block_diff
+            .as_ref()
+            .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "No block diff available"))?;
+        let path_indices = affected_pools
+            .iter()
+            .filter_map(|pool| self.arb_paths.paths_by_pool.get(&pool.address))
+            .flatten()
+            .copied()
+            .unique()
+            .collect();
+        self.simulate_path_indices(amount_in, path_indices)
+    }
+
+    fn apply_logs(
+        state: &mut HashMap<Address, AMM>,
+        logs: Vec<Log>,
+    ) -> Result<AMMBlockDiff, StateSpaceError> {
+        let mut block_diff = AMMBlockDiff::new();
+        for log in logs {
+            let address = log.address();
+            /* If we dont have this AMM, we can discard the log events */
+            if let Some(amm) = state.get_mut(&address) {
+                match log.topic0() {
+                    Some(topic0 @ &IUniswapV2Pair::Sync::SIGNATURE_HASH) => match amm {
+                        AMM::UniswapV2Pool(pool) => {
+                            let decoded_log = IUniswapV2Pair::Sync::decode_log(&log.inner)
+                                .map_err(|e| StateSpaceError::AlloyError(e))?;
+                            let r0_post = decoded_log.reserve0.to::<u128>();
+                            let r1_post = decoded_log.reserve1.to::<u128>();
+                            let pool_diff = PoolDiff {
+                                topic_name: IUniswapV2Pair::Sync::SIGNATURE.to_string(),
+                                topic: *topic0,
+                                address,
+                                pre: PoolReserves {
+                                    r0: pool.reserve_0,
+                                    r1: pool.reserve_1,
+                                },
+                                post: PoolReserves {
+                                    r0: r0_post,
+                                    r1: r1_post,
+                                },
+                            };
+                            pool.reserve_0 = r0_post;
+                            pool.reserve_1 = r1_post;
+                            pool.count = Some(pool.count.unwrap_or(0) + 1);
+                            info!(target = "state_space::sync", amm = ?pool, "Synced AMM (staged)");
+                            block_diff.push(pool_diff);
+                        }
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Ok(block_diff)
+    }
+
     pub fn get(&self, address: &Address) -> Option<&AMM> {
-        self.state.get(address)
+        self.pools.get(address)
     }
 
     pub fn get_mut(&mut self, address: &Address) -> Option<&mut AMM> {
-        self.state.get_mut(address)
+        self.pools.get_mut(address)
     }
 
     pub fn get_counts(&self) -> Vec<String> {
-        let pools = self.state.values().clone().filter_map(|amm| match amm {
+        let pools = self.pools.values().clone().filter_map(|amm| match amm {
             AMM::UniswapV2Pool(pool) => Some(pool.clone()),
             _ => None,
         });
@@ -1167,92 +1307,13 @@ impl StateSpace {
         top_pools
     }
 
-    pub fn sync(&mut self, logs: &[Log]) -> Result<Vec<Address>, StateSpaceError> {
-        let latest = self.latest_block.load(Ordering::Relaxed);
-        let Some(mut block_number) = logs
-            .first()
-            .map(|log| log.block_number.ok_or(StateSpaceError::MissingBlockNumber))
-            .transpose()?
-        else {
-            return Ok(vec![]);
-        };
-
-        // Check if there is a reorg and unwind to state before block_number
-        if latest >= block_number {
-            info!(
-                target: "state_space::sync",
-                from = %latest,
-                to = %block_number - 1,
-                "Unwinding state changes"
-            );
-
-            let cached_state = self.cache.unwind_state_changes(block_number);
-            for amm in cached_state {
-                debug!(target: "state_space::sync", ?amm, "Reverting AMM state");
-                self.state.insert(amm.address(), amm);
-            }
-        }
-
-        let mut cached_amms = HashSet::new();
-        let mut affected_amms = HashSet::new();
-        for log in logs {
-            // If the block number is updated, cache the current block state changes
-            let log_block_number = log
-                .block_number
-                .ok_or(StateSpaceError::MissingBlockNumber)?;
-            if log_block_number != block_number {
-                let amms = cached_amms.drain().collect::<Vec<AMM>>();
-                affected_amms.extend(amms.iter().map(|amm| amm.address()));
-                let state_change = StateChange::new(amms, block_number);
-
-                debug!(
-                    target: "state_space::sync",
-                    state_change = ?state_change,
-                    "Caching state change"
-                );
-
-                self.cache.push(state_change);
-                block_number = log_block_number;
-            }
-
-            // If the AMM is in the state space add the current state to cache and sync from log
-            let address = log.address();
-            if let Some(amm) = self.state.get_mut(&address) {
-                cached_amms.insert(amm.clone());
-                amm.sync(log)?;
-
-                info!(
-                    target: "state_space::sync",
-                    ?amm,
-                    "Synced AMM"
-                );
-            }
-        }
-
-        if !cached_amms.is_empty() {
-            let amms = cached_amms.drain().collect::<Vec<AMM>>();
-            affected_amms.extend(amms.iter().map(|amm| amm.address()));
-            let state_change = StateChange::new(amms, block_number);
-
-            debug!(
-                target: "state_space::sync",
-                state_change = ?state_change,
-                "Caching state change"
-            );
-
-            self.cache.push(state_change);
-        }
-
-        Ok(affected_amms.into_iter().collect())
-    }
-
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let l1 = if f.alternate() { 20 } else { 10 };
-        let l2 = self.state.len();
+        let l2 = self.pools.len();
 
         writeln!(f, "StateSpace ({}/{})", l1, l2)?;
 
-        for amm in self.state.values().take(l1) {
+        for amm in self.pools.values().take(l1) {
             match amm {
                 AMM::UniswapV2Pool(pool) => {
                     writeln!(f, "{}:", pool.id())?;

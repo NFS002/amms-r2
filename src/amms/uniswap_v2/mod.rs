@@ -80,6 +80,12 @@ sol!(
 
 #[derive(Error, Debug)]
 pub enum UniswapV2Error {
+    #[error("Swap arithmetic overflow")]
+    ArithmeticOverflow,
+    #[error("Invalid swap fee: {0} (maximum 100000)")]
+    InvalidFee(usize),
+    #[error("Invalid token pair: {base} -> {quote}")]
+    InvalidTokenPair { base: Address, quote: Address },
     #[error("Division by zero")]
     DivisionByZero,
     #[error("Rounding Error")]
@@ -139,53 +145,46 @@ impl AutomatedMarketMaker for UniswapV2Pool {
     fn simulate_swap(
         &self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        if self.token_a.address == base_token {
-            Ok(self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_0),
-                U256::from(self.reserve_1),
-            ))
+        let forward = self.swap_direction(base_token, quote_token)?;
+        let (reserve_in, reserve_out) = if forward {
+            (self.reserve_0, self.reserve_1)
         } else {
-            Ok(self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_1),
-                U256::from(self.reserve_0),
-            ))
-        }
+            (self.reserve_1, self.reserve_0)
+        };
+        self.get_amount_out(amount_in, U256::from(reserve_in), U256::from(reserve_out))
     }
 
     fn simulate_swap_mut(
         &mut self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        if self.token_a.address == base_token {
-            let amount_out = self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_0),
-                U256::from(self.reserve_1),
-            );
-
-            self.reserve_0 += amount_in.to::<u128>();
-            self.reserve_1 -= amount_out.to::<u128>();
-
-            Ok(amount_out)
+        let forward = self.swap_direction(base_token, quote_token)?;
+        let amount_out = self.simulate_swap(base_token, quote_token, amount_in)?;
+        let input = u128::try_from(amount_in).map_err(|_| UniswapV2Error::ArithmeticOverflow)?;
+        let output = u128::try_from(amount_out).map_err(|_| UniswapV2Error::ArithmeticOverflow)?;
+        let (reserve_in, reserve_out) = if forward {
+            (self.reserve_0, self.reserve_1)
         } else {
-            let amount_out = self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_1),
-                U256::from(self.reserve_0),
-            );
-
-            self.reserve_0 -= amount_out.to::<u128>();
-            self.reserve_1 += amount_in.to::<u128>();
-
-            Ok(amount_out)
-        }
+            (self.reserve_1, self.reserve_0)
+        };
+        // Calculate both values before publishing either, so errors leave the pool unchanged.
+        let reserve_in = reserve_in
+            .checked_add(input)
+            .ok_or(UniswapV2Error::ArithmeticOverflow)?;
+        let reserve_out = reserve_out
+            .checked_sub(output)
+            .ok_or(UniswapV2Error::ArithmeticOverflow)?;
+        (self.reserve_0, self.reserve_1) = if forward {
+            (reserve_in, reserve_out)
+        } else {
+            (reserve_out, reserve_in)
+        };
+        Ok(amount_out)
     }
 
     fn tokens(&self) -> Vec<Address> {
@@ -271,17 +270,44 @@ impl UniswapV2Pool {
         }
     }
 
-    /// Calculates the amount received for a given `amount_in` `reserve_in` and `reserve_out`.
-    pub fn get_amount_out(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
-        if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
-            return U256::ZERO;
+    fn swap_direction(&self, base: Address, quote: Address) -> Result<bool, AMMError> {
+        if base != quote && base == self.token_a.address && quote == self.token_b.address {
+            Ok(true)
+        } else if base != quote && base == self.token_b.address && quote == self.token_a.address {
+            Ok(false)
+        } else {
+            Err(UniswapV2Error::InvalidTokenPair { base, quote }.into())
         }
-        let fee = U256_100000 - U256::from(self.fee);
-        let amount_in = amount_in * fee;
-        let numerator = amount_in * reserve_out;
-        let denominator = reserve_in * U256_100000 + amount_in;
+    }
 
-        numerator / denominator
+    /// Calculates output with fees in units of 1/100000, rounding down.
+    /// Returns an error if any intermediate calculation overflows U256.
+    pub fn get_amount_out(
+        &self,
+        amount_in: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+    ) -> Result<U256, AMMError> {
+        let fee_multiplier = U256_100000
+            .checked_sub(U256::from(self.fee))
+            .ok_or(UniswapV2Error::InvalidFee(self.fee))?;
+        if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        let effective_input = amount_in
+            .checked_mul(fee_multiplier)
+            .ok_or(UniswapV2Error::ArithmeticOverflow)?;
+        let numerator = effective_input
+            .checked_mul(reserve_out)
+            .ok_or(UniswapV2Error::ArithmeticOverflow)?;
+        let denominator = reserve_in
+            .checked_mul(U256_100000)
+            .and_then(|reserve| reserve.checked_add(effective_input))
+            .ok_or(UniswapV2Error::ArithmeticOverflow)?;
+        let amount_out = numerator
+            .checked_div(denominator)
+            .ok_or(UniswapV2Error::ArithmeticOverflow)?;
+        Ok(amount_out)
     }
 
     /// Calculates the price of the base token in terms of the quote token.
@@ -715,27 +741,111 @@ impl DiscoverySync for UniswapV2Factory {
 
 #[cfg(test)]
 mod tests {
-    use crate::amms::{
-        amm::AutomatedMarketMaker, consts::U256_100000, uniswap_v2::UniswapV2Pool, Token,
-    };
+    use crate::amms::{amm::AutomatedMarketMaker, uniswap_v2::UniswapV2Pool, Token};
     use alloy::primitives::{address, Address, U256};
 
     #[test]
     fn test_get_amount_out() {
-        let fees = [125, 150, 300, 1000]; // 0.125%, 0.15%, 0.3%, 1%
-        let amount_in = U256::from(10).pow(U256::from(18));
-        let reserve_in = U256::from(100).pow(U256::from(18));
-        let reserve_out = U256::from(100).pow(U256::from(18));
-        let amount_out_no_fee = (reserve_out * amount_in) / (reserve_in + amount_in);
-        for fee in fees {
-            let pool = UniswapV2Pool {
-                fee,
-                ..Default::default()
-            };
-
-            let res = pool.get_amount_out(amount_in, reserve_in, reserve_out);
-            assert!(amount_out_no_fee * (U256_100000 - U256::from(fee)) / U256_100000 == res);
+        // Independently calculated integer reference values, including substantial price impact.
+        for (fee, input, reserve_in, reserve_out, expected) in [
+            (125, 1_000_000u64, 10_000_000u64, 10_000_000u64, 908_057u64),
+            (150, 1_000_000, 10_000_000, 10_000_000, 907_851),
+            (300, 1_000_000, 10_000_000, 10_000_000, 906_610),
+            (1000, 1_000_000, 10_000_000, 10_000_000, 900_818),
+            (300, 1_000_000, 1_000_000, 1_000_000, 499_248),
+            (300, 10_000, 1_000_000, 2_000_000, 19_743),
+            (300, 10_000, 2_000_000, 1_000_000, 4_960),
+            (300, 1, 1_000_000, 1_000_000, 0),
+        ] {
+            let pool = UniswapV2Pool::new(Address::ZERO, fee);
+            assert_eq!(
+                pool.get_amount_out(
+                    U256::from(input),
+                    U256::from(reserve_in),
+                    U256::from(reserve_out)
+                )
+                .unwrap(),
+                U256::from(expected)
+            );
         }
+    }
+
+    #[test]
+    fn swap_overflows_and_invalid_fees_return_errors() {
+        let mut pool = UniswapV2Pool::new(Address::ZERO, 300);
+        for (input, reserve_in, reserve_out) in [
+            (U256::MAX, U256::ONE, U256::ONE),
+            (U256::from(2), U256::ONE, U256::MAX),
+            (U256::ONE, U256::MAX, U256::ONE),
+            (U256::ONE, U256::MAX / U256::from(100_000), U256::ONE),
+        ] {
+            assert!(matches!(
+                pool.get_amount_out(input, reserve_in, reserve_out),
+                Err(crate::amms::error::AMMError::UniswapV2Error(
+                    super::UniswapV2Error::ArithmeticOverflow
+                ))
+            ));
+        }
+        pool.fee = 100_001;
+        assert!(matches!(
+            pool.get_amount_out(U256::ONE, U256::ONE, U256::ONE),
+            Err(crate::amms::error::AMMError::UniswapV2Error(
+                super::UniswapV2Error::InvalidFee(100_001)
+            ))
+        ));
+    }
+
+    #[test]
+    fn swap_validates_both_tokens_and_preserves_reserves_on_error() {
+        let a = Address::repeat_byte(1);
+        let b = Address::repeat_byte(2);
+        let unknown = Address::repeat_byte(3);
+        let mut pool = UniswapV2Pool::new(Address::ZERO, 300);
+        pool.token_a.address = a;
+        pool.token_b.address = b;
+        pool.reserve_0 = 1_000_000;
+        pool.reserve_1 = 2_000_000;
+        for (base, quote) in [
+            (a, a),
+            (b, b),
+            (unknown, a),
+            (a, unknown),
+            (unknown, unknown),
+        ] {
+            assert!(matches!(
+                pool.simulate_swap(base, quote, U256::ONE),
+                Err(crate::amms::error::AMMError::UniswapV2Error(
+                    super::UniswapV2Error::InvalidTokenPair { .. }
+                ))
+            ));
+            assert!(pool.simulate_swap_mut(base, quote, U256::ONE).is_err());
+            assert_eq!((pool.reserve_0, pool.reserve_1), (1_000_000, 2_000_000));
+        }
+        for (base, quote) in [(a, b), (b, a)] {
+            let mut updated = pool.clone();
+            let output = pool.simulate_swap(base, quote, U256::from(10_000)).unwrap();
+            assert_eq!(
+                updated
+                    .simulate_swap_mut(base, quote, U256::from(10_000))
+                    .unwrap(),
+                output
+            );
+            let expected = if base == a {
+                (1_010_000, 2_000_000 - output.to::<u128>())
+            } else {
+                (1_000_000 - output.to::<u128>(), 2_010_000)
+            };
+            assert_eq!((updated.reserve_0, updated.reserve_1), expected);
+        }
+        pool.reserve_0 = u128::MAX;
+        pool.reserve_1 = 1;
+        assert!(pool.simulate_swap_mut(a, b, U256::ONE).is_err());
+        assert_eq!((pool.reserve_0, pool.reserve_1), (u128::MAX, 1));
+        pool.reserve_0 = 1;
+        assert!(pool
+            .simulate_swap_mut(a, b, U256::from(u128::MAX) + U256::ONE)
+            .is_err());
+        assert_eq!((pool.reserve_0, pool.reserve_1), (1, 1));
     }
 
     #[test]

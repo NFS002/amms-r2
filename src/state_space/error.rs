@@ -20,4 +20,6 @@ pub enum StateSpaceError {
     MissingBlockAtIdx(usize),
     #[error(transparent)]
     AlloyError(#[from] AlloyError),
+    #[error(transparent)]
+    StdError(#[from] std::io::Error)
 }

@@ -5,7 +5,7 @@ use super::{
     uniswap_v3::UniswapV3Error,
 };
 use alloy::{
-    primitives::{BlockHash, FixedBytes},
+    primitives::{Address, BlockHash, FixedBytes},
     transports::TransportErrorKind,
 };
 use serde_json::Error as JSONError;
@@ -14,6 +14,10 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AMMError {
+    #[error("Pool {0} is missing from the state")]
+    PoolNotFound(Address),
+    #[error("Pool {0} is not a supported Uniswap pool")]
+    UnsupportedUniswapPool(Address),
     #[error(transparent)]
     TransportError(#[from] alloy::transports::RpcError<TransportErrorKind>),
     #[error(transparent)]

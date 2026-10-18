@@ -1,16 +1,20 @@
-use std::{collections::HashMap, fmt, time::Instant};
+use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, UniswapPool, AMM},
     error::AMMError,
     uniswap_v2::UniswapV2Pool,
+    uniswap_v3::UniswapV3Pool,
+    Token,
 };
-use alloy::primitives::{Address, B256, BlockHash, I256, U256, keccak256, map::AddressMap};
+use crate::state_space::StateSpace;
+use alloy::primitives::{keccak256, map::AddressMap, Address, BlockHash, B256, I256, U256};
 use chrono::{DateTime, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-type PathId = usize;
+type PathIndex = usize;
 
 #[derive(Debug, Clone)]
 pub struct SwapHop {
@@ -21,7 +25,7 @@ pub struct SwapHop {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniswapHop {
-    pub pool: UniswapPool,
+    pub pool_address: Address,
     pub base: Address,
     pub quote: Address,
 }
@@ -36,65 +40,304 @@ pub struct UniswapArbPath {
     pub hops: Vec<UniswapHop>,
 }
 
+// Shared encoding keeps live paths and owned snapshots on the same identity scheme.
+fn route_id(hops: impl Iterator<Item = (Address, Address, Address)>) -> B256 {
+    let mut route = Vec::new();
+    for (pool, base, quote) in hops {
+        route.extend_from_slice(pool.as_slice());
+        route.extend_from_slice(base.as_slice());
+        route.extend_from_slice(quote.as_slice());
+    }
+    keccak256(route)
+}
+
 impl UniswapArbPath {
     pub fn id(&self) -> B256 {
-        let mut addresses: Vec<u8> = Vec::with_capacity(96);
-        self.hops.iter().for_each(|h| addresses.extend_from_slice(h.pool.address().as_slice()));
-        keccak256(addresses)
+        route_id(
+            self.hops
+                .iter()
+                .map(|hop| (hop.pool_address, hop.base, hop.quote)),
+        )
     }
 
-    pub fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let hops = self.hops.iter().enumerate();
-        let length = hops.len();
-        for (idx, UniswapHop { pool, ..}) in hops {
-            writeln!(f, "Hop {}/{}", idx + 1, length)?;
-            //writeln!(f, "\tPool: {}", pool)?;
-            // writeln!(f, "\tFee: {}", pool.fee())?;
-            // writeln!(f, "\t\tToken (a): {}", pool.token_a().address)?;
-            // writeln!(f, "\t\t\tToken (a) decimals: {}", pool.token_a().decimals())?;
-            // writeln!(f, "\t\t\tToken (a) reserves: {}", pool.r0())?;
-            // writeln!(f, "\t\tToken (b): {}", pool.token_b().address)?;
-            // writeln!(f, "\t\t\tToken (b) decimals: {}", pool.token_b().decimals())?;
-            // writeln!(f, "\t\t\tToken (b) reserves: {}", pool.r1())?;
-        }
-        writeln!(f, "")
+    /// Borrow the pools currently stored in this state for simulation or display.
+    ///
+    /// The returned view cannot outlive the state borrow (or its read guard).
+    pub fn resolve<'state>(
+        &self,
+        state: &'state StateSpace,
+    ) -> Result<ResolvedUniswapArbPath<'state>, AMMError> {
+        self.resolve_pools(&state.pools)
+    }
+
+    pub(crate) fn resolve_pools<'state>(
+        &self,
+        pools: &'state HashMap<Address, AMM>,
+    ) -> Result<ResolvedUniswapArbPath<'state>, AMMError> {
+        let hops = self
+            .hops
+            .iter()
+            .map(|hop| {
+                let pool = match pools
+                    .get(&hop.pool_address)
+                    .ok_or(AMMError::PoolNotFound(hop.pool_address))?
+                {
+                    AMM::UniswapV2Pool(pool) => ResolvedUniswapPool::V2(pool),
+                    AMM::UniswapV3Pool(pool) => ResolvedUniswapPool::V3(pool),
+                    _ => return Err(AMMError::UnsupportedUniswapPool(hop.pool_address)),
+                };
+                Ok(ResolvedUniswapHop {
+                    pool,
+                    base: hop.base,
+                    quote: hop.quote,
+                })
+            })
+            .collect::<Result<_, AMMError>>()?;
+
+        Ok(ResolvedUniswapArbPath { hops })
     }
 }
 
 impl fmt::Display for UniswapArbPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.fmt(f)
+        for (idx, hop) in self.hops.iter().enumerate() {
+            writeln!(f, "Hop {}/{}", idx + 1, self.hops.len())?;
+            writeln!(f, "\tPool: {}", hop.pool_address)?;
+            writeln!(f, "\tDirection: {} -> {}", hop.base, hop.quote)?;
+        }
+        Ok(())
     }
 }
 
 impl fmt::Debug for UniswapArbPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.fmt(f)
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// A temporary path view over the live pools borrowed from one state.
+pub struct ResolvedUniswapArbPath<'state> {
+    hops: Vec<ResolvedUniswapHop<'state>>,
+}
+
+/// An owned copy of the pools and directions used by a simulation.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UniswapArbPathSnapshot {
+    pub hops: Vec<UniswapHopSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniswapHopSnapshot {
+    pub pool: UniswapPool,
+    pub base: Address,
+    pub quote: Address,
+}
+
+impl UniswapArbPathSnapshot {
+    pub fn id(&self) -> B256 {
+        route_id(
+            self.hops
+                .iter()
+                .map(|hop| (hop.pool.address(), hop.base, hop.quote)),
+        )
+    }
+
+    fn as_resolved(&self) -> ResolvedUniswapArbPath<'_> {
+        ResolvedUniswapArbPath {
+            hops: self
+                .hops
+                .iter()
+                .map(|hop| ResolvedUniswapHop {
+                    pool: match &hop.pool {
+                        UniswapPool::V2(pool) => ResolvedUniswapPool::V2(pool),
+                        UniswapPool::V3(pool) => ResolvedUniswapPool::V3(pool),
+                    },
+                    base: hop.base,
+                    quote: hop.quote,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn simulate(&self, amount_in: U256) -> Result<U256, AMMError> {
+        self.as_resolved().simulate(amount_in)
+    }
+}
+
+impl fmt::Display for UniswapArbPathSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.as_resolved(), f)
+    }
+}
+
+impl fmt::Debug for UniswapArbPathSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+struct ResolvedUniswapHop<'state> {
+    pool: ResolvedUniswapPool<'state>,
+    base: Address,
+    quote: Address,
+}
+
+enum ResolvedUniswapPool<'state> {
+    V2(&'state UniswapV2Pool),
+    V3(&'state UniswapV3Pool),
+}
+
+impl ResolvedUniswapArbPath<'_> {
+    /// Clone the underlying pool values so the snapshot outlives the state guard.
+    pub fn snapshot(&self) -> UniswapArbPathSnapshot {
+        UniswapArbPathSnapshot {
+            hops: self
+                .hops
+                .iter()
+                .map(|hop| UniswapHopSnapshot {
+                    pool: match hop.pool {
+                        ResolvedUniswapPool::V2(pool) => UniswapPool::V2(pool.clone()),
+                        ResolvedUniswapPool::V3(pool) => UniswapPool::V3(pool.clone()),
+                    },
+                    base: hop.base,
+                    quote: hop.quote,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn simulate(&self, amount_in: U256) -> Result<U256, AMMError> {
+        let mut amount = amount_in;
+        for hop in &self.hops {
+            amount = match hop.pool {
+                ResolvedUniswapPool::V2(pool) => pool.simulate_swap(hop.base, hop.quote, amount)?,
+                ResolvedUniswapPool::V3(pool) => pool.simulate_swap(hop.base, hop.quote, amount)?,
+            };
+        }
+        Ok(amount)
+    }
+}
+
+fn fmt_token(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    token: &Token,
+    reserves: Option<u128>,
+) -> fmt::Result {
+    writeln!(f, "\t\tToken ({label}): {}", token.address)?;
+    writeln!(f, "\t\t\tToken ({label}) decimals: {}", token.decimals)?;
+    if let Some(reserves) = reserves {
+        writeln!(f, "\t\t\tToken ({label}) reserves: {reserves}")?;
+    }
+    Ok(())
+}
+
+impl fmt::Display for ResolvedUniswapArbPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (idx, hop) in self.hops.iter().enumerate() {
+            writeln!(f, "Hop {}/{}", idx + 1, self.hops.len())?;
+            writeln!(f, "\tDirection: {} -> {}", hop.base, hop.quote)?;
+            match hop.pool {
+                ResolvedUniswapPool::V2(pool) => {
+                    writeln!(f, "\tPool: {}", pool.address)?;
+                    writeln!(f, "\tFee: {}", pool.fee)?;
+                    fmt_token(f, "a", &pool.token_a, Some(pool.reserve_0))?;
+                    fmt_token(f, "b", &pool.token_b, Some(pool.reserve_1))?;
+                }
+                ResolvedUniswapPool::V3(pool) => {
+                    writeln!(f, "\tPool: {}", pool.address)?;
+                    writeln!(f, "\tFee: {}", pool.fee)?;
+                    fmt_token(f, "a", &pool.token_a, None)?;
+                    fmt_token(f, "b", &pool.token_b, None)?;
+                    writeln!(f, "\tLiquidity: {}", pool.liquidity)?;
+                    writeln!(f, "\tSqrt price X96: {}", pool.sqrt_price)?;
+                    writeln!(f, "\tTick: {}", pool.tick)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ResolvedUniswapArbPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UniswapV2SimulationResult {
-    pub path_id: usize,
-    pub spread_pct: U256,
+pub struct SimulationContext {
+    pub chain_id: u64,
+    pub block_number: u64,
+    pub block_hash: BlockHash,
+    pub parent_hash: BlockHash,
+    pub block_timestamp: u64,
+    pub base_fee_per_gas: Option<u64>,
+    pub gas_used: u64,
+    pub gas_limit: u64,
+    /// When the batch finished simulating.
+    pub simulated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationBatch {
+    pub context: Arc<SimulationContext>,
+    pub results: Vec<UniswapSimulationResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniswapSimulationResult {
+    pub path_snapshot: UniswapArbPathSnapshot,
     pub amount_in: U256,
     pub amount_out: U256,
     pub pct_gain_bp: I256,
-    pub block_number: u64,
-    pub block_hash: BlockHash,
-    pub simulated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedSimulation {
+    pub context: Arc<SimulationContext>,
+    pub result: UniswapSimulationResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniswapArbPathEntry {
     pub path: UniswapArbPath,
-    pub last_simulation: Option<UniswapV2SimulationResult>,
+    pub last_simulation: Option<CachedSimulation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UniswapArbPaths {
     pub paths: Vec<UniswapArbPathEntry>,
-    pub paths_by_pool: AddressMap<Vec<PathId>>,
+    /// Positions in `paths`; rebuild this index if paths are reordered or removed.
+    pub paths_by_pool: AddressMap<Vec<PathIndex>>,
+    /// Route IDs mapped to positions in `paths`.
+    pub path_indices_by_id: HashMap<B256, PathIndex>,
+}
+
+impl UniswapArbPaths {
+    pub fn get_by_id(&self, path_id: &B256) -> Option<&UniswapArbPathEntry> {
+        self.path_indices_by_id
+            .get(path_id)
+            .and_then(|&index| self.paths.get(index))
+    }
+
+    /// Call after changing path topology or the ordering of `paths`.
+    /// Duplicate route IDs resolve to their first entry.
+    pub fn rebuild_indices(&mut self) {
+        self.paths_by_pool.clear();
+        self.path_indices_by_id.clear();
+        for (index, entry) in self.paths.iter().enumerate() {
+            self.path_indices_by_id
+                .entry(entry.path.id())
+                .or_insert(index);
+            for hop in &entry.path.hops {
+                let indices = self.paths_by_pool.entry(hop.pool_address).or_default();
+                if indices.last() != Some(&index) {
+                    indices.push(index);
+                }
+            }
+        }
+    }
 }
 
 impl ArbPath {
@@ -103,18 +346,6 @@ impl ArbPath {
 
         for hop in &self.hops {
             amount = hop.amm.simulate_swap(hop.base, hop.quote, amount)?;
-        }
-
-        Ok(amount)
-    }
-}
-
-impl UniswapArbPath {
-    pub fn simulate(&self, amount_in: U256) -> Result<U256, AMMError> {
-        let mut amount = amount_in;
-
-        for hop in &self.hops {
-            amount = hop.pool.simulate_swap(hop.base, hop.quote, amount)?;
         }
 
         Ok(amount)
@@ -166,7 +397,7 @@ pub fn find_arb_paths_v2(pools: Vec<UniswapV2Pool>, token_in: Address) -> Uniswa
                 if third == first || third == second {
                     continue;
                 }
-                let path_id = result.paths.len();
+                let path_index = result.paths.len();
                 let hops = [(first, token_in, a), (second, a, b), (third, b, token_in)]
                     .into_iter()
                     .map(|(id, base, quote)| {
@@ -174,15 +405,21 @@ pub fn find_arb_paths_v2(pools: Vec<UniswapV2Pool>, token_in: Address) -> Uniswa
                             .paths_by_pool
                             .entry(pools[id].address)
                             .or_default()
-                            .push(path_id);
+                            .push(path_index);
                         UniswapHop {
-                            pool: UniswapPool::V2(pools[id].clone().into()),
+                            pool_address: pools[id].address,
                             base,
                             quote,
                         }
-                    }).collect();
+                    })
+                    .collect();
+                let path = UniswapArbPath { hops };
+                result
+                    .path_indices_by_id
+                    .entry(path.id())
+                    .or_insert(path_index);
                 result.paths.push(UniswapArbPathEntry {
-                    path: UniswapArbPath { hops },
+                    path,
                     last_simulation: None,
                 });
             }
