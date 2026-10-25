@@ -14,6 +14,10 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AMMError {
+    #[error("Percentage change is undefined for a zero starting amount")]
+    UndefinedPercentageChange,
+    #[error("Percentage change exceeds the signed 256-bit range")]
+    PercentageChangeOverflow,
     #[error("Pool {0} is missing from the state")]
     PoolNotFound(Address),
     #[error("Pool {0} is not a supported Uniswap pool")]

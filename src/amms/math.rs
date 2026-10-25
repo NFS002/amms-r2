@@ -1,4 +1,4 @@
-use alloy::primitives::{I256, U256};
+use alloy::primitives::{I256, U256, U512};
 
 use rug::Float;
 
@@ -25,39 +25,98 @@ pub fn u256_to_float(num: U256) -> Result<Float, AMMError> {
     Ok(Float::with_val(MPFR_T_PRECISION, parsed_value))
 }
 
-/// Returns signed percentage change in basis points (1 bp = 0.01%)
-/// Example: 1234 => +12.34%, -50 => -0.50%
-pub fn percentage_change_bp(old: U256, new: U256) -> I256 {
+/// Signed percentage change in basis points (1 bp = 0.01%), truncated toward zero.
+/// Returns an error for zero input or a result outside the I256 range.
+pub fn percentage_change_bp(old: U256, new: U256) -> Result<I256, AMMError> {
     if old.is_zero() {
-        return I256::ZERO
+        return Err(AMMError::UndefinedPercentageChange);
     }
-
-    // Determine sign and absolute difference
-    let (sign, diff) = if new >= old {
-        (I256::ONE, new - old)
-    } else {
-        (I256::MINUS_ONE, old - new)
-    };
-
-    // Overflow-safe ordering:
-    // (diff / old) * 10000 would lose precision,
-    // so we instead do (diff * 10000) / old
-    // but split the multiplication to reduce overflow risk.
-    let scaled = diff
-        .checked_mul(U256::from(10_000u64))
-        .map_or(U256::ZERO, |r| r.checked_div(old).unwrap_or(U256::ZERO));
-
-    I256::from_raw(scaled) * sign
+    let negative = new < old;
+    let diff = if negative { old - new } else { new - old };
+    // The full product fits in 512 bits even for U256::MAX.
+    let scaled = U512::from(diff) * U512::from(10_000u64) / U512::from(old);
+    if scaled > U512::from(I256::MAX.into_raw()) {
+        return Err(AMMError::PercentageChangeOverflow);
+    }
+    let pct_change_bp = I256::from_raw(U256::from(scaled));
+    // Losses cannot exceed 10,000 bp because both inputs are unsigned.
+    Ok(if negative { -pct_change_bp } else { pct_change_bp })
 }
 
 pub fn format_percent_bp(bp: &I256) -> String {
     let sign = if bp.is_negative() { "-" } else { "" };
-    let abs = bp.abs();
+    let abs = bp.unsigned_abs();
 
-    let integer = abs / I256::unchecked_from(100);
-    let fractional = abs % I256::unchecked_from(100);
+    let integer = abs / U256::from(100);
+    let fractional = abs % U256::from(100);
 
     format!("{sign}{integer}.{fractional:02}%")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn percentage_examples_and_truncation() {
+        for (old, new, expected) in [
+            (10000u64, 10001u64, "0.01%"),
+            (10000, 9999, "-0.01%"),
+            (100, 527, "427.00%"),
+            (100, 0, "-100.00%"),
+            (100, 100, "0.00%"),
+            (30000, 30001, "0.00%"),
+            (30000, 29999, "0.00%"),
+            (3, 4, "33.33%"),
+            (3, 2, "-33.33%"),
+        ] {
+            let bp = percentage_change_bp(U256::from(old), U256::from(new)).unwrap();
+            assert_eq!(format_percent_bp(&bp), expected);
+        }
+    }
+
+    #[test]
+    fn full_width_inputs_preserve_representable_results() {
+        let half = U256::MAX / U256::from(2);
+        assert_eq!(
+            percentage_change_bp(half, half * U256::from(2)).unwrap(),
+            I256::unchecked_from(10000)
+        );
+        assert_eq!(
+            percentage_change_bp(U256::MAX, U256::ZERO).unwrap(),
+            I256::unchecked_from(-10000)
+        );
+        assert_eq!(
+            percentage_change_bp(U256::MAX, U256::MAX).unwrap(),
+            I256::ZERO
+        );
+    }
+
+    #[test]
+    fn invalid_percentages_are_errors() {
+        for new in [U256::ZERO, U256::ONE] {
+            assert!(matches!(
+                percentage_change_bp(U256::ZERO, new),
+                Err(AMMError::UndefinedPercentageChange)
+            ));
+        }
+        assert!(matches!(
+            percentage_change_bp(U256::ONE, U256::MAX),
+            Err(AMMError::PercentageChangeOverflow)
+        ));
+        // The product fits U256, but must not be reinterpreted as a negative I256.
+        let new = (U256::ONE << 255) / U256::from(10000) + U256::from(2);
+        assert!(matches!(
+            percentage_change_bp(U256::ONE, new),
+            Err(AMMError::PercentageChangeOverflow)
+        ));
+    }
+
+    #[test]
+    fn formats_minimum_signed_value_without_overflow() {
+        assert_eq!(
+            format_percent_bp(&I256::MIN),
+            "-578960446186580977117854925043439539266349923328202820197287920039565648199.68%"
+        );
+    }
+}

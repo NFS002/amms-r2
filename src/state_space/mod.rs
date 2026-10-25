@@ -612,7 +612,7 @@ impl<N, P> StateSpaceManager<N, P> {
         let batch = {
             let mut state = self.state.write().await;
             let amount_in = U256::from(WETH_AMOUNT_IN);
-            if state.head_buffer.blocks.len() == 1 {
+            if state.head_buffer.blocks.len() == 2 {
                 state.simulate_all_paths(amount_in)?
             } else {
                 state.simulate_affected_paths(amount_in)?
@@ -781,7 +781,24 @@ where
     }
 
     pub fn with_amms(self, amms: Vec<AMM>) -> StateSpaceBuilder<N, P> {
-        StateSpaceBuilder { amms, ..self }
+        let amms_with_ids = amms
+            .into_iter()
+            .map(|amm| {
+                if let AMM::UniswapV2Pool(mut pool) = amm {
+                    pool.set_ids();
+                    pool.reserve_0 = 0;
+                    pool.reserve_1 = 0;
+                    AMM::UniswapV2Pool(pool)
+                } else {
+                    unreachable!("This is not supposed to happen!");
+                }
+            })
+            .collect_vec();
+
+        StateSpaceBuilder {
+            amms: amms_with_ids,
+            ..self
+        }
     }
 
     pub fn with_filters(self, filters: Vec<PoolFilter>) -> StateSpaceBuilder<N, P> {
@@ -1149,7 +1166,8 @@ impl StateSpace {
             let path_entry = &mut self.arb_paths.paths[path_index];
             let simulated_result = path_entry.path.resolve_pools(pools).and_then(|path| {
                 let amount_out = path.simulate(amount_in)?;
-                Ok((amount_out, path.snapshot()))
+                let pct_change = percentage_change_bp(amount_in, amount_out)?;
+                Ok((amount_out, path.snapshot(), pct_change))
             });
             match simulated_result {
                 Err(e) => {
@@ -1161,8 +1179,7 @@ impl StateSpace {
                         "Error simulating path",
                     );
                 }
-                Ok((amount_out, path_snapshot)) => {
-                    let pct_change = percentage_change_bp(amount_in, amount_out);
+                Ok((amount_out, path_snapshot, pct_change)) => {
                     let full_result = UniswapSimulationResult {
                         path_snapshot,
                         amount_in,

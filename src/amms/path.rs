@@ -11,8 +11,41 @@ use crate::state_space::StateSpace;
 use alloy::primitives::{keccak256, map::AddressMap, Address, BlockHash, B256, I256, U256};
 use chrono::{DateTime, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+
+// Hash topology only; reserves and other pool state do not affect identity.
+fn route_id(hops: impl Iterator<Item = (Address, Address, Address)>) -> B256 {
+    let mut route = Vec::new();
+    for (pool, base, quote) in hops {
+        route.extend_from_slice(pool.as_slice());
+        route.extend_from_slice(base.as_slice());
+        route.extend_from_slice(quote.as_slice());
+    }
+    keccak256(route)
+}
+
+// Serialized IDs are derived data: reconstruct them from topology on input.
+#[derive(Deserialize)]
+struct PathTopology {
+    hops: Vec<UniswapHop>,
+}
+
+impl From<PathTopology> for UniswapArbPath {
+    fn from(value: PathTopology) -> Self {
+        Self::from_hops(value.hops)
+    }
+}
+
+#[derive(Deserialize)]
+struct SnapshotTopology {
+    hops: Vec<UniswapHopSnapshot>,
+}
+
+impl From<SnapshotTopology> for UniswapArbPathSnapshot {
+    fn from(value: SnapshotTopology) -> Self {
+        Self::from_hops(value.hops)
+    }
+}
 
 type PathIndex = usize;
 
@@ -36,28 +69,27 @@ pub struct ArbPath {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "PathTopology")]
 pub struct UniswapArbPath {
-    pub hops: Vec<UniswapHop>,
-}
-
-// Shared encoding keeps live paths and owned snapshots on the same identity scheme.
-fn route_id(hops: impl Iterator<Item = (Address, Address, Address)>) -> B256 {
-    let mut route = Vec::new();
-    for (pool, base, quote) in hops {
-        route.extend_from_slice(pool.as_slice());
-        route.extend_from_slice(base.as_slice());
-        route.extend_from_slice(quote.as_slice());
-    }
-    keccak256(route)
+    hops: Vec<UniswapHop>,
+    id: B256,
 }
 
 impl UniswapArbPath {
     pub fn id(&self) -> B256 {
-        route_id(
-            self.hops
-                .iter()
+        self.id
+    }
+
+    pub fn hops(&self) -> &[UniswapHop] {
+        &self.hops
+    }
+
+    pub fn from_hops(hops: Vec<UniswapHop>) -> Self {
+        let id = route_id(
+            hops.iter()
                 .map(|hop| (hop.pool_address, hop.base, hop.quote)),
-        )
+        );
+        Self { hops, id }
     }
 
     /// Borrow the pools currently stored in this state for simulation or display.
@@ -94,7 +126,7 @@ impl UniswapArbPath {
             })
             .collect::<Result<_, AMMError>>()?;
 
-        Ok(ResolvedUniswapArbPath { hops })
+        Ok(ResolvedUniswapArbPath { hops, id: self.id })
     }
 }
 
@@ -117,13 +149,16 @@ impl fmt::Debug for UniswapArbPath {
 
 /// A temporary path view over the live pools borrowed from one state.
 pub struct ResolvedUniswapArbPath<'state> {
+    id: B256,
     hops: Vec<ResolvedUniswapHop<'state>>,
 }
 
 /// An owned copy of the pools and directions used by a simulation.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "SnapshotTopology")]
 pub struct UniswapArbPathSnapshot {
-    pub hops: Vec<UniswapHopSnapshot>,
+    id: B256,
+    hops: Vec<UniswapHopSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,15 +170,24 @@ pub struct UniswapHopSnapshot {
 
 impl UniswapArbPathSnapshot {
     pub fn id(&self) -> B256 {
-        route_id(
-            self.hops
-                .iter()
+        self.id
+    }
+
+    pub fn hops(&self) -> &[UniswapHopSnapshot] {
+        &self.hops
+    }
+
+    pub fn from_hops(hops: Vec<UniswapHopSnapshot>) -> Self {
+        let id = route_id(
+            hops.iter()
                 .map(|hop| (hop.pool.address(), hop.base, hop.quote)),
-        )
+        );
+        Self { hops, id }
     }
 
     fn as_resolved(&self) -> ResolvedUniswapArbPath<'_> {
         ResolvedUniswapArbPath {
+            id: self.id,
             hops: self
                 .hops
                 .iter()
@@ -188,9 +232,14 @@ enum ResolvedUniswapPool<'state> {
 }
 
 impl ResolvedUniswapArbPath<'_> {
+    pub fn id(&self) -> B256 {
+        self.id
+    }
+
     /// Clone the underlying pool values so the snapshot outlives the state guard.
     pub fn snapshot(&self) -> UniswapArbPathSnapshot {
         UniswapArbPathSnapshot {
+            id: self.id,
             hops: self
                 .hops
                 .iter()
@@ -306,12 +355,29 @@ pub struct UniswapArbPathEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(from = "PathEntries")]
 pub struct UniswapArbPaths {
     pub paths: Vec<UniswapArbPathEntry>,
     /// Positions in `paths`; rebuild this index if paths are reordered or removed.
     pub paths_by_pool: AddressMap<Vec<PathIndex>>,
     /// Route IDs mapped to positions in `paths`.
     pub path_indices_by_id: HashMap<B256, PathIndex>,
+}
+
+#[derive(Deserialize)]
+struct PathEntries {
+    paths: Vec<UniswapArbPathEntry>,
+}
+
+impl From<PathEntries> for UniswapArbPaths {
+    fn from(value: PathEntries) -> Self {
+        let mut paths = Self {
+            paths: value.paths,
+            ..Self::default()
+        };
+        paths.rebuild_indices();
+        paths
+    }
 }
 
 impl UniswapArbPaths {
@@ -328,7 +394,7 @@ impl UniswapArbPaths {
         self.path_indices_by_id.clear();
         for (index, entry) in self.paths.iter().enumerate() {
             self.path_indices_by_id
-                .entry(entry.path.id())
+                .entry(entry.path.id)
                 .or_insert(index);
             for hop in &entry.path.hops {
                 let indices = self.paths_by_pool.entry(hop.pool_address).or_default();
@@ -413,10 +479,10 @@ pub fn find_arb_paths_v2(pools: Vec<UniswapV2Pool>, token_in: Address) -> Uniswa
                         }
                     })
                     .collect();
-                let path = UniswapArbPath { hops };
+                let path = UniswapArbPath::from_hops(hops);
                 result
                     .path_indices_by_id
-                    .entry(path.id())
+                    .entry(path.id)
                     .or_insert(path_index);
                 result.paths.push(UniswapArbPathEntry {
                     path,

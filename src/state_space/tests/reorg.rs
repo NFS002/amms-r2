@@ -124,13 +124,11 @@ fn add_test_path(state: &mut StateSpace) {
     pool.token_a.address = BASE;
     pool.token_b.address = QUOTE;
     state.arb_paths.paths.push(UniswapArbPathEntry {
-        path: UniswapArbPath {
-            hops: vec![UniswapHop {
+        path: UniswapArbPath::from_hops(vec![UniswapHop {
                 pool_address: POOL,
                 base: BASE,
                 quote: QUOTE,
-            }],
-        },
+            }]),
         last_simulation: None,
     });
     state.arb_paths.paths_by_pool.insert(POOL, vec![0]);
@@ -589,7 +587,7 @@ async fn simulation_batch_and_cache_share_committed_block_context() {
     let result = &batch.results[0];
     assert_eq!(
         result.pct_gain_bp,
-        percentage_change_bp(result.amount_in, result.amount_out)
+        percentage_change_bp(result.amount_in, result.amount_out).unwrap()
     );
     let json = serde_json::to_string(&batch).unwrap();
     let restored: SimulationBatch = serde_json::from_str(&json).unwrap();

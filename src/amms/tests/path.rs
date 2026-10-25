@@ -73,7 +73,7 @@ fn check(pools: Vec<UniswapV2Pool>, start: Address, expected_count: usize) {
     assert_eq!(result.path_indices_by_id.len(), result.paths.len());
     for entry in &result.paths {
         assert!(std::ptr::eq(
-            result.get_by_id(&entry.path.id()).unwrap(),
+            result.get_by_id(&entry.path.id).unwrap(),
             entry
         ));
     }
@@ -197,13 +197,11 @@ fn live_path_fixture() -> (UniswapArbPath, StateSpace) {
     pool.token_b.decimals = 6;
     pool.reserve_0 = 1_000_000;
     pool.reserve_1 = 2_000_000;
-    let path = UniswapArbPath {
-        hops: vec![UniswapHop {
-            pool_address: pool.address,
-            base: pool.token_a.address,
-            quote: pool.token_b.address,
-        }],
-    };
+    let path = UniswapArbPath::from_hops(vec![UniswapHop {
+        pool_address: pool.address,
+        base: pool.token_a.address,
+        quote: pool.token_b.address,
+    }]);
     let mut state = StateSpace::default();
     state.pools.insert(pool.address, AMM::UniswapV2Pool(pool));
     (path, state)
@@ -244,7 +242,7 @@ fn resolved_path_borrows_live_pools_and_observes_updated_reserves() {
 #[test]
 fn path_resolves_replaced_state_map_without_rebuilding_topology() {
     let (path, mut state) = live_path_fixture();
-    let path_id = path.id();
+    let path_id = path.id;
     let initial_amount = path
         .resolve(&state)
         .unwrap()
@@ -262,7 +260,7 @@ fn path_resolves_replaced_state_map_without_rebuilding_topology() {
         U256::from(4_960)
     );
     assert_ne!(view.simulate(U256::from(10_000)).unwrap(), initial_amount);
-    assert_eq!(path.id(), path_id);
+    assert_eq!(path.id, path_id);
 }
 
 #[test]
@@ -340,7 +338,7 @@ fn persistent_hops_serialize_addresses_without_pool_state() {
     );
     assert!(hop.get("pool").is_none());
     let restored: UniswapArbPath = serde_json::from_value(encoded).unwrap();
-    assert_eq!(restored.id(), path.id());
+    assert_eq!(restored.id, path.id);
     assert_eq!(restored.hops[0].base, path.hops[0].base);
     assert_eq!(restored.hops[0].quote, path.hops[0].quote);
 }
@@ -363,7 +361,7 @@ fn snapshot_preserves_simulation_and_display_after_live_state_changes() {
     let expected = view.simulate(amount_in).unwrap();
     let expected_display = view.to_string();
     let snapshot = view.snapshot();
-    assert_eq!(snapshot.id(), path.id());
+    assert_eq!(snapshot.id, path.id);
     let AMM::UniswapV2Pool(pool) = state.pools.get_mut(&path.hops[0].pool_address).unwrap() else {
         panic!("expected v2 pool");
     };
@@ -405,24 +403,25 @@ fn route_identity_includes_pool_direction_and_hop_order() {
     let (path, _) = live_path_fixture();
     let original_id = path.id();
     assert_eq!(path.clone().id(), original_id);
-    let mut changed = path.clone();
-    changed.hops[0].base = path.hops[0].quote;
-    changed.hops[0].quote = path.hops[0].base;
-    assert_ne!(changed.id(), original_id);
-    changed = path.clone();
-    changed.hops[0].pool_address = Address::repeat_byte(99);
-    assert_ne!(changed.id(), original_id);
-    changed.hops.push(path.hops[0].clone());
-    let ordered_id = changed.id();
-    changed.hops.reverse();
-    assert_ne!(changed.id(), ordered_id);
+    let mut hops = path.hops().to_vec();
+    hops[0].base = path.hops()[0].quote;
+    hops[0].quote = path.hops()[0].base;
+    assert_ne!(UniswapArbPath::from_hops(hops).id(), original_id);
+    let mut hops = path.hops().to_vec();
+    hops[0].pool_address = Address::repeat_byte(99);
+    assert_ne!(UniswapArbPath::from_hops(hops.clone()).id(), original_id);
+    hops.push(path.hops()[0].clone());
+    let ordered_id = UniswapArbPath::from_hops(hops.clone()).id();
+    hops.reverse();
+    assert_ne!(UniswapArbPath::from_hops(hops).id(), ordered_id);
 }
 
 #[test]
 fn rebuilding_indices_updates_lookup_after_reordering_and_removal() {
     let (path, _) = live_path_fixture();
-    let mut other = path.clone();
-    other.hops[0].pool_address = Address::repeat_byte(99);
+    let mut hops = path.hops().to_vec();
+    hops[0].pool_address = Address::repeat_byte(99);
+    let other = UniswapArbPath::from_hops(hops);
     let first_id = path.id();
     let second_id = other.id();
     let mut paths = UniswapArbPaths::default();
@@ -444,4 +443,40 @@ fn rebuilding_indices_updates_lookup_after_reordering_and_removal() {
     assert!(paths.get_by_id(&first_id).is_none());
     assert_eq!(paths.paths_by_pool.len(), 1);
     assert_eq!(paths.get_by_id(&second_id).unwrap().path.id(), second_id);
+}
+
+#[test]
+fn deserialization_recomputes_route_and_snapshot_ids() {
+    let (path, state) = live_path_fixture();
+    let mut encoded = serde_json::to_value(&path).unwrap();
+    encoded["id"] = serde_json::to_value(B256::ZERO).unwrap();
+    let restored: UniswapArbPath = serde_json::from_value(encoded).unwrap();
+    assert_eq!(restored.id(), path.id());
+    let snapshot = path.resolve(&state).unwrap().snapshot();
+    let mut encoded = serde_json::to_value(&snapshot).unwrap();
+    encoded["id"] = serde_json::to_value(B256::ZERO).unwrap();
+    let restored: UniswapArbPathSnapshot = serde_json::from_str(&encoded.to_string()).unwrap();
+    assert_eq!(restored.id(), snapshot.id());
+    assert_eq!(
+        UniswapArbPathSnapshot::from_hops(snapshot.hops().to_vec()).id(),
+        path.id()
+    );
+}
+
+#[test]
+fn deserialization_rebuilds_indexes_from_topology() {
+    let (path, _) = live_path_fixture();
+    let id = path.id();
+    let pool = path.hops()[0].pool_address;
+    let paths = UniswapArbPaths {
+        paths: vec![UniswapArbPathEntry {
+            path,
+            last_simulation: None,
+        }],
+        ..Default::default()
+    };
+    let restored: UniswapArbPaths =
+        serde_json::from_str(&serde_json::to_string(&paths).unwrap()).unwrap();
+    assert_eq!(restored.get_by_id(&id).unwrap().path.id(), id);
+    assert_eq!(restored.paths_by_pool[&pool], vec![0]);
 }
